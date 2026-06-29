@@ -133,7 +133,7 @@ def test_factorize_nmf_gpu_fp32_compute_still_returns_float64_numpy_outputs(kern
 
 
 def test_nmf_gpu_adapter_ignores_self_and_delegates_to_factorize_nmf_gpu(kernel, monkeypatch):
-    """Verify the cNMF monkeypatch adapter forwards args and ignores its bound `self`."""
+    """Verify the cNMF adapter extracts embedded GPU args and ignores its bound `self`."""
     calls = []
     sentinel = (object(), object())
 
@@ -143,13 +143,14 @@ def test_nmf_gpu_adapter_ignores_self_and_delegates_to_factorize_nmf_gpu(kernel,
 
     monkeypatch.setattr(kernel, "factorize_nmf_gpu", fake_factorize)
     X = np.ones((3, 2))
-    nmf_kwargs = {"n_components": 1}
     gpu_kwargs = {"device": "cpu"}
+    nmf_kwargs = {"engine": "gpu", "gpu": gpu_kwargs, "n_components": 1}
 
-    result = kernel._nmf_gpu(object(), X, nmf_kwargs, gpu_kwargs)
+    result = kernel._nmf_gpu(object(), X, nmf_kwargs)
 
     assert result is sentinel
-    assert calls == [(X, nmf_kwargs, gpu_kwargs)]
+    assert calls == [(X, {"n_components": 1}, gpu_kwargs)]
+    assert nmf_kwargs == {"engine": "gpu", "gpu": gpu_kwargs, "n_components": 1}
 
 
 # ---------------------------------------------------------------------
