@@ -47,5 +47,11 @@ setuptools.setup(
    'palettable',
    'scipy',
    'pyyaml'
-   ]
+   ],
+    extras_require={
+        # GPU NMF engine (src/cnmf/nmf_gpu.py): PyTorch multiplicative-update kernel.
+        # Install with:  pip install -e ".[gpu]"
+        'gpu': ['torch>=2.0'],
+        'test': ['pytest'],
+    },
 )
