@@ -42,6 +42,7 @@ Device, dtype, imports, sparse, and backend policy
 """
 
 from types import SimpleNamespace
+import argparse
 import builtins
 
 import numpy as np
@@ -56,7 +57,6 @@ from utils import (
     require_nmf_runtime,
     small_nonnegative_matrix,
 )
-
 
 # ---------------------------------------------------------------------
 # Test harness
@@ -505,6 +505,138 @@ def test_resolve_gpu_opts_floors_check_every_and_compile_block_to_at_least_one(k
 
     assert opts["check_every"] == 1
     assert opts["compile_block"] == 1
+
+
+# ---------------------------------------------------------------------
+# GPU CLI and cNMF engine wiring
+# ---------------------------------------------------------------------
+def test_parse_gpu_args_defaults_to_none_until_user_sets_engine(kernel):
+    """CLI flags should default to None so absent options are distinguishable from explicit values."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args([])
+
+    assert args.engine is None
+    for name in ("gpu_device", "gpu_dtype", "gpu_allow_tf32", "gpu_compile",
+                 "gpu_eps", "gpu_check_every", "gpu_compile_block"):
+        assert getattr(args, name) is None, f"{name} should default to None"
+
+
+def test_gpu_kwargs_from_args_rejects_gpu_options_without_gpu_engine(kernel):
+    """GPU-specific CLI options should raise unless `--engine gpu` was explicitly selected."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    for argv in (["--gpu-device", "cuda"], ["--engine", "cpu", "--gpu-device", "cuda"]):
+        with pytest.raises(ValueError, match="require --engine gpu"):
+            kernel.gpu_kwargs_from_args(parser.parse_args(argv))
+
+
+def test_gpu_kwargs_from_args_fills_defaults_when_gpu_engine_selected(kernel):
+    """`--engine gpu` alone should resolve missing GPU options from DEFAULT_GPU."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args(["--engine", "gpu"])
+
+    assert kernel.gpu_kwargs_from_args(args) == kernel.DEFAULT_GPU
+
+
+def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
+    """GPU CLI override values should normalize through the same resolver as config dict values."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args([
+        "--engine", "gpu",
+        "--gpu-device", "CUDA:0",        # device is lower-cased by _resolve_gpu_opts
+        "--gpu-dtype", "FP32",
+        "--gpu-allow-tf32",              # store_const flags -> True
+        "--gpu-compile",
+        "--gpu-eps", "1e-8",
+        "--gpu-check-every", "5",
+        "--gpu-compile-block", "100",
+    ])
+
+    assert kernel.gpu_kwargs_from_args(args) == {
+        "device": "cuda:0",
+        "dtype": "fp32",
+        "allow_tf32": True,
+        "compile": True,
+        "eps": 1e-8,
+        "check_every": 5,
+        "compile_block": 100,
+    }
+
+
+def test_validate_engine_args_for_command_rejects_non_factorize_gpu_options(kernel):
+    """Engine/GPU options should be accepted only for commands that support GPU factorization."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize",)
+
+    # factorize accepts engine/GPU options (no raise)
+    kernel.validate_engine_args_for_command(parser.parse_args(["factorize", "--engine", "gpu"]), supported)
+
+    # a non-factorize command carrying engine/GPU options is rejected
+    for argv in (["prepare", "--engine", "gpu"], ["consensus", "--gpu-device", "cuda"]):
+        with pytest.raises(ValueError, match="only valid with"):
+            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+    # a non-factorize command without engine/GPU options is fine
+    kernel.validate_engine_args_for_command(parser.parse_args(["prepare"]), supported)
+
+
+def test_configure_nmf_engine_cpu_leaves_cnmf_instance_unchanged(kernel):
+    """The default CPU engine should be a no-op so existing sklearn behavior is preserved."""
+    class DummyCNMF:
+        def _nmf(self, X, nmf_kwargs):
+            return "sklearn-path"
+
+    obj = DummyCNMF()
+    result = kernel.configure_nmf_engine(obj, engine="cpu", gpu_kwargs={"device": "cuda"})
+
+    assert result is obj
+    assert "_nmf" not in vars(obj)                  # no instance override added
+    assert obj._nmf("X", {}) == "sklearn-path"      # original class method intact
+
+
+def test_configure_nmf_engine_rejects_unknown_engine(kernel):
+    """Unknown engine names should fail loudly instead of silently using CPU."""
+    with pytest.raises(ValueError, match="engine must be 'cpu' or 'gpu'"):
+        kernel.configure_nmf_engine(object(), engine="tpu")
+
+
+def test_configure_nmf_engine_gpu_patches_instance_nmf_with_adapter(kernel, monkeypatch):
+    """The GPU engine should replace the instance `_nmf` callable with the GPU adapter path."""
+    captured = {}
+
+    def fake_nmf_gpu(self, X, nmf_kwargs):
+        captured["self"], captured["X"], captured["nmf_kwargs"] = self, X, dict(nmf_kwargs)
+        return ("spectra", "usages")
+
+    monkeypatch.setattr(kernel, "_nmf_gpu", fake_nmf_gpu)
+
+    class DummyCNMF:
+        def _nmf(self, X, nmf_kwargs):
+            return "sklearn-path"
+
+    obj = DummyCNMF()
+    gpu_kwargs = {"device": "cuda", "dtype": "fp32"}
+    result = kernel.configure_nmf_engine(obj, engine="gpu", gpu_kwargs=gpu_kwargs)
+
+    assert result is obj
+    assert "_nmf" in vars(obj)                                  # instance _nmf is now overridden
+
+    out = obj._nmf("Xdata", {"n_components": 5})
+
+    assert out == ("spectra", "usages")                        # dispatched through the GPU adapter
+    assert captured["self"] is obj and captured["X"] == "Xdata"
+    assert captured["nmf_kwargs"]["engine"] == "gpu"           # engine + gpu kwargs embedded first
+    assert captured["nmf_kwargs"]["gpu"] == gpu_kwargs
+    assert captured["nmf_kwargs"]["n_components"] == 5         # original kwargs preserved
 
 
 # ---------------------------------------------------------------------
