@@ -1267,7 +1267,7 @@ def main():
     
     args = parser.parse_args()
     try:
-        engine_commands = ('factorize',)
+        engine_commands = ('factorize', 'consensus')
         validate_engine_args_for_command(args, engine_commands)
     except ValueError as e:
         parser.error(str(e))
