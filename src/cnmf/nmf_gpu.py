@@ -327,10 +327,21 @@ def _mu_step_fixed_h(W, H, Xg, eps):
 # ---------------------------------------------------------------------
 
 
+def _recon_err(Xg, W, H, xnorm2):
+    """Per-replicate ‖X − WH‖_F via the identity ‖X‖² − 2⟨X,WH⟩ + ‖WH‖², using only small
+    [R,k,g]/[R,k,k] matmuls (WᵀX, WᵀW, HHᵀ) — it NEVER materializes the [R,n,g] product, so batched
+    fits scale to millions of cells (a full [R,n,g] residual would be ~R·n·g floats, tens of GB).
+    Returns a 0-dim tensor (unbatched) or shape-[R] (batched); xnorm2 = ‖X‖² is precomputed once."""
+    Wt = W.transpose(-2, -1)
+    cross = ((Wt @ Xg) * H).sum(dim=(-2, -1))                          # ⟨X, WH⟩ per replicate
+    whnorm = ((Wt @ W) * (H @ H.transpose(-2, -1))).sum(dim=(-2, -1))  # ‖WH‖² per replicate
+    return (xnorm2 - 2.0 * cross + whnorm).clamp_min(0).sqrt()
+
+
 def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run full MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
+    xnorm2 = torch.dot(Xg.reshape(-1), Xg.reshape(-1))     # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -339,7 +350,7 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
             for _ in range(n):                             # MU updates run inside the (compiled) step
                 W, H = step(W, H, Xg, eps)
             it += n
-            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
+            err = _recon_err(Xg, W, H, xnorm2)
             if err_init is None:
                 err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
             elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
@@ -351,7 +362,7 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
 def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run fixed-H MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
+    xnorm2 = torch.dot(Xg.reshape(-1), Xg.reshape(-1))     # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -360,7 +371,7 @@ def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, devi
             for _ in range(n):
                 W = step(W, H, Xg, eps)
             it += n
-            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
+            err = _recon_err(Xg, W, H, xnorm2)
             if err_init is None:
                 err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
             elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
