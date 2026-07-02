@@ -1,4 +1,4 @@
-"""Reliability tests for the standalone NMF GPU kernel (`bin/nmf_gpu.py`).
+"""Reliability tests for the NMF GPU kernel (`src/cnmf/nmf_gpu.py`).
 
 Scope
 -----
@@ -12,7 +12,7 @@ Sections
 Public API and reconstruction contract
     Verifies that factorization actually reduces reconstruction error, returns
     the cNMF-compatible `(spectra, usages) = (H, W)` order, keeps float64 numpy
-    outputs for compatibility, and preserves the thin `_nmf_gpu` adapter shape.
+    outputs for compatibility, and preserves the thin `nmf_gpu` adapter shape.
 
 MU update order, convergence, and iteration bounds
     Pins the sklearn-style W-then-H multiplicative-update order, early-stop
@@ -58,11 +58,12 @@ from utils import (
     small_nonnegative_matrix,
 )
 
+
 # ---------------------------------------------------------------------
 # Test harness
 # ---------------------------------------------------------------------
 def test_kernel_loader_fails_when_kernel_file_is_missing(tmp_path):
-    """Fail the test harness clearly if the standalone kernel script is absent."""
+    """Fail the test harness clearly if the kernel module is absent."""
     missing_kernel = tmp_path / "missing_nmf_gpu.py"
 
     with pytest.raises(pytest.fail.Exception, match="Required NMF GPU kernel file is missing"):
@@ -72,13 +73,13 @@ def test_kernel_loader_fails_when_kernel_file_is_missing(tmp_path):
 # ---------------------------------------------------------------------
 # Public API and reconstruction contract
 # ---------------------------------------------------------------------
-def test_factorize_nmf_gpu_reconstructs_known_low_rank_matrix_with_small_relative_error(kernel):
+def test_nmf_gpu_reconstructs_known_low_rank_matrix_with_small_relative_error(kernel):
     """Factorize an exact low-rank non-negative matrix and require low relative error."""
     require_nmf_runtime()
     k = 3
     X = low_rank_matrix(rank=k)
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": k, "max_iter": 600, "tol": 0, "random_state": 0},
         {"device": "cpu", "check_every": 600},
@@ -89,12 +90,12 @@ def test_factorize_nmf_gpu_reconstructs_known_low_rank_matrix_with_small_relativ
     assert rel < 1e-3
 
 
-def test_factorize_nmf_gpu_returns_spectra_then_usages_with_cnmf_orientation(kernel):
+def test_nmf_gpu_returns_spectra_then_usages_with_cnmf_orientation(kernel):
     """Pin the public return order as spectra H first, usages W second."""
     require_nmf_runtime()
     X = small_nonnegative_matrix(cells=7, genes=5)
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 2, "max_iter": 2, "random_state": 0},
         {"device": "cpu"},
@@ -104,11 +105,11 @@ def test_factorize_nmf_gpu_returns_spectra_then_usages_with_cnmf_orientation(ker
     assert W.shape == (7, 2)
 
 
-def test_factorize_nmf_gpu_cpu_smoke_shapes_dtype_sign_and_finiteness(kernel):
+def test_nmf_gpu_cpu_smoke_shapes_dtype_sign_and_finiteness(kernel):
     """Smoke-test CPU output shape, float64 compatibility dtype, finite values, and non-negativity."""
     require_nmf_runtime()
     X = small_nonnegative_matrix()
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 3, "max_iter": 3, "random_state": 0},
         {"device": "cpu"},
@@ -117,12 +118,12 @@ def test_factorize_nmf_gpu_cpu_smoke_shapes_dtype_sign_and_finiteness(kernel):
     assert_valid_nmf_output(X, H, W, 3)
 
 
-def test_factorize_nmf_gpu_fp32_compute_still_returns_float64_numpy_outputs(kernel):
+def test_nmf_gpu_fp32_compute_still_returns_float64_numpy_outputs(kernel):
     """Exercise fp32 compute while keeping the public numpy output contract as float64."""
     require_nmf_runtime()
     X = small_nonnegative_matrix()
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 2, "max_iter": 1, "random_state": 0},
         {"device": "cpu", "dtype": "fp32"},
@@ -132,7 +133,7 @@ def test_factorize_nmf_gpu_fp32_compute_still_returns_float64_numpy_outputs(kern
     assert W.dtype == np.float64
 
 
-def test_nmf_gpu_adapter_ignores_self_and_delegates_to_factorize_nmf_gpu(kernel, monkeypatch):
+def test_nmf_gpu_adapter_ignores_self_and_delegates_to_nmf_gpu(kernel, monkeypatch):
     """Verify the cNMF adapter extracts embedded GPU args and ignores its bound `self`."""
     calls = []
     sentinel = (object(), object())
@@ -141,12 +142,12 @@ def test_nmf_gpu_adapter_ignores_self_and_delegates_to_factorize_nmf_gpu(kernel,
         calls.append((X, nmf_kwargs, gpu_kwargs))
         return sentinel
 
-    monkeypatch.setattr(kernel, "factorize_nmf_gpu", fake_factorize)
+    monkeypatch.setattr(kernel, "_nmf_gpu", fake_factorize)
     X = np.ones((3, 2))
     gpu_kwargs = {"device": "cpu"}
     nmf_kwargs = {"engine": "gpu", "gpu": gpu_kwargs, "n_components": 1}
 
-    result = kernel._nmf_gpu(object(), X, nmf_kwargs)
+    result = kernel.nmf_gpu(object(), X, nmf_kwargs)
 
     assert result is sentinel
     assert calls == [(X, {"n_components": 1}, gpu_kwargs)]
@@ -230,12 +231,12 @@ def test_compile_mode_matches_eager_output_for_same_seed_and_options(kernel, mon
     X = small_nonnegative_matrix(cells=8, genes=6)
     nmf_kwargs = {"n_components": 2, "max_iter": 4, "tol": -1.0, "random_state": 0}
 
-    eager_H, eager_W = kernel.factorize_nmf_gpu(
+    eager_H, eager_W = kernel._nmf_gpu(
         X,
         nmf_kwargs,
         {"device": "cpu", "dtype": "fp64", "compile": False, "check_every": 1},
     )
-    compiled_H, compiled_W = kernel.factorize_nmf_gpu(
+    compiled_H, compiled_W = kernel._nmf_gpu(
         X,
         nmf_kwargs,
         {"device": "cpu", "dtype": "fp64", "compile": True, "compile_block": 2},
@@ -262,28 +263,28 @@ def test_compile_mode_uses_explicit_multi_iteration_compile_block_when_requested
 # ---------------------------------------------------------------------
 # Initialization and reproducibility
 # ---------------------------------------------------------------------
-def test_factorize_nmf_gpu_random_state_is_reproducible(kernel):
+def test_nmf_gpu_random_state_is_reproducible(kernel):
     """The same random_state should produce identical initialization and final factors."""
     require_nmf_runtime()
     X = small_nonnegative_matrix()
     kwargs = {"n_components": 3, "max_iter": 3, "random_state": 13}
     gpu = {"device": "cpu", "check_every": 3}
 
-    H1, W1 = kernel.factorize_nmf_gpu(X, kwargs, gpu)
-    H2, W2 = kernel.factorize_nmf_gpu(X, kwargs, gpu)
+    H1, W1 = kernel._nmf_gpu(X, kwargs, gpu)
+    H2, W2 = kernel._nmf_gpu(X, kwargs, gpu)
 
     assert np.allclose(H1, H2)
     assert np.allclose(W1, W2)
 
 
-def test_factorize_nmf_gpu_different_random_state_changes_result(kernel):
+def test_nmf_gpu_different_random_state_changes_result(kernel):
     """Different random_state values should produce different random initial factors."""
     require_nmf_runtime()
     X = small_nonnegative_matrix()
     kwargs = {"n_components": 3, "max_iter": 0, "init": "random"}
 
-    H1, W1 = kernel.factorize_nmf_gpu(X, dict(kwargs, random_state=1), {"device": "cpu"})
-    H2, W2 = kernel.factorize_nmf_gpu(X, dict(kwargs, random_state=2), {"device": "cpu"})
+    H1, W1 = kernel._nmf_gpu(X, dict(kwargs, random_state=1), {"device": "cpu"})
+    H2, W2 = kernel._nmf_gpu(X, dict(kwargs, random_state=2), {"device": "cpu"})
 
     assert not np.allclose(H1, H2)
     assert not np.allclose(W1, W2)
@@ -333,7 +334,7 @@ def test_nndsvd_initializers_pass_through_to_sklearn_initializer(kernel, monkeyp
     assert seen == ["nndsvd", "nndsvda", "nndsvdar"]
 
 
-def test_factorize_nmf_gpu_custom_init_raises(kernel):
+def test_nmf_gpu_custom_init_raises(kernel):
     """Document that custom W/H initialization is not implemented in this standalone API."""
     with pytest.raises(NotImplementedError, match="custom"):
         kernel._init_wh(small_nonnegative_matrix(), 2, 0, "custom")
@@ -342,30 +343,30 @@ def test_factorize_nmf_gpu_custom_init_raises(kernel):
 # ---------------------------------------------------------------------
 # Input validation and degenerate shapes
 # ---------------------------------------------------------------------
-def test_factorize_nmf_gpu_rejects_negative_input(kernel):
+def test_nmf_gpu_rejects_negative_input(kernel):
     """NMF input must be non-negative."""
     with pytest.raises(ValueError, match="non-negative"):
         kernel._to_checked_array(np.array([[1.0, -0.1]]))
 
 
-def test_factorize_nmf_gpu_rejects_nan_input(kernel):
+def test_nmf_gpu_rejects_nan_input(kernel):
     """NaN input should fail before torch/sklearn runtime work begins."""
     with pytest.raises(ValueError, match="NaN/inf"):
         kernel._to_checked_array(np.array([[1.0, np.nan]]))
 
 
-def test_factorize_nmf_gpu_rejects_inf_input(kernel):
+def test_nmf_gpu_rejects_inf_input(kernel):
     """Infinite input should fail before torch/sklearn runtime work begins."""
     with pytest.raises(ValueError, match="NaN/inf"):
         kernel._to_checked_array(np.array([[1.0, np.inf]]))
 
 
-def test_factorize_nmf_gpu_zero_matrix_does_not_crash_or_divide_by_zero(kernel):
+def test_nmf_gpu_zero_matrix_does_not_crash_or_divide_by_zero(kernel):
     """All-zero input should take the degenerate path without crashing or producing invalid output."""
     require_nmf_runtime()
     X = np.zeros((5, 4))
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 2, "max_iter": 5, "random_state": 0},
         {"device": "cpu"},
@@ -374,16 +375,16 @@ def test_factorize_nmf_gpu_zero_matrix_does_not_crash_or_divide_by_zero(kernel):
     assert_valid_nmf_output(X, H, W, 2)
 
 
-def test_factorize_nmf_gpu_handles_single_row_and_single_column_inputs(kernel):
+def test_nmf_gpu_handles_single_row_and_single_column_inputs(kernel):
     """Single-row and single-column matrices should keep valid H/W orientation."""
     require_nmf_runtime()
 
-    H_row, W_row = kernel.factorize_nmf_gpu(
+    H_row, W_row = kernel._nmf_gpu(
         np.array([[1.0, 2.0, 3.0]]),
         {"n_components": 1, "max_iter": 1, "random_state": 0},
         {"device": "cpu"},
     )
-    H_col, W_col = kernel.factorize_nmf_gpu(
+    H_col, W_col = kernel._nmf_gpu(
         np.array([[1.0], [2.0], [3.0]]),
         {"n_components": 1, "max_iter": 1, "random_state": 0},
         {"device": "cpu"},
@@ -395,7 +396,7 @@ def test_factorize_nmf_gpu_handles_single_row_and_single_column_inputs(kernel):
     assert W_col.shape == (3, 1)
 
 
-def test_factorize_nmf_gpu_rejects_empty_or_zero_dimensional_inputs(kernel):
+def test_nmf_gpu_rejects_empty_or_zero_dimensional_inputs(kernel):
     """Reject empty matrices and non-2D arrays with clear validation errors."""
     for X in (np.empty((0, 3)), np.empty((3, 0))):
         with pytest.raises(ValueError, match="at least one row"):
@@ -405,23 +406,23 @@ def test_factorize_nmf_gpu_rejects_empty_or_zero_dimensional_inputs(kernel):
         kernel._to_checked_array(np.array([1.0, 2.0]))
 
 
-def test_factorize_nmf_gpu_rejects_zero_components(kernel):
+def test_nmf_gpu_rejects_zero_components(kernel):
     """Reject rank k=0 before reaching sklearn's initializer."""
     require_nmf_runtime()
     with pytest.raises(ValueError, match="n_components"):
-        kernel.factorize_nmf_gpu(
+        kernel._nmf_gpu(
             np.ones((3, 3)),
             {"n_components": 0, "max_iter": 1, "random_state": 0},
             {"device": "cpu"},
         )
 
 
-def test_factorize_nmf_gpu_defines_behavior_when_k_exceeds_min_dimension(kernel):
+def test_nmf_gpu_defines_behavior_when_k_exceeds_min_dimension(kernel):
     """Allow sklearn-compatible overcomplete factorization when k exceeds matrix dimensions."""
     require_nmf_runtime()
     X = small_nonnegative_matrix(cells=3, genes=2)
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 4, "max_iter": 1, "random_state": 0},
         {"device": "cpu"},
@@ -460,6 +461,7 @@ def test_resolve_gpu_opts_dict_values_override_defaults(kernel):
         "eps": 1e-8,
         "check_every": 7,
         "compile_block": 9,
+        "batch": 1,             # not overridden here -> default
     }
 
 
@@ -505,181 +507,6 @@ def test_resolve_gpu_opts_floors_check_every_and_compile_block_to_at_least_one(k
 
     assert opts["check_every"] == 1
     assert opts["compile_block"] == 1
-
-
-# ---------------------------------------------------------------------
-# GPU CLI and cNMF engine wiring
-# ---------------------------------------------------------------------
-def test_parse_gpu_args_defaults_to_none_until_user_sets_engine(kernel):
-    """CLI flags should default to None so absent options are distinguishable from explicit values."""
-    parser = argparse.ArgumentParser()
-    kernel.parse_gpu_args(parser)
-
-    args = parser.parse_args([])
-
-    assert args.engine is None
-    for name in ("gpu_device", "gpu_dtype", "gpu_allow_tf32", "gpu_compile",
-                 "gpu_eps", "gpu_check_every", "gpu_compile_block"):
-        assert getattr(args, name) is None, f"{name} should default to None"
-
-
-def test_gpu_kwargs_from_args_rejects_gpu_options_without_gpu_engine(kernel):
-    """GPU-specific CLI options should raise unless `--engine gpu` was explicitly selected."""
-    parser = argparse.ArgumentParser()
-    kernel.parse_gpu_args(parser)
-
-    for argv in (["--gpu-device", "cuda"], ["--engine", "cpu", "--gpu-device", "cuda"]):
-        with pytest.raises(ValueError, match="require --engine gpu"):
-            kernel.gpu_kwargs_from_args(parser.parse_args(argv))
-
-
-def test_gpu_kwargs_from_args_fills_defaults_when_gpu_engine_selected(kernel):
-    """`--engine gpu` alone should resolve missing GPU options from DEFAULT_GPU."""
-    parser = argparse.ArgumentParser()
-    kernel.parse_gpu_args(parser)
-
-    args = parser.parse_args(["--engine", "gpu"])
-
-    assert kernel.gpu_kwargs_from_args(args) == kernel.DEFAULT_GPU
-
-
-def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
-    """GPU CLI override values should normalize through the same resolver as config dict values."""
-    parser = argparse.ArgumentParser()
-    kernel.parse_gpu_args(parser)
-
-    args = parser.parse_args([
-        "--engine", "gpu",
-        "--gpu-device", "CUDA:0",        # device is lower-cased by _resolve_gpu_opts
-        "--gpu-dtype", "FP32",
-        "--gpu-allow-tf32",              # store_const flags -> True
-        "--gpu-compile",
-        "--gpu-eps", "1e-8",
-        "--gpu-check-every", "5",
-        "--gpu-compile-block", "100",
-    ])
-
-    assert kernel.gpu_kwargs_from_args(args) == {
-        "device": "cuda:0",
-        "dtype": "fp32",
-        "allow_tf32": True,
-        "compile": True,
-        "eps": 1e-8,
-        "check_every": 5,
-        "compile_block": 100,
-    }
-
-
-def test_validate_engine_args_for_command_rejects_non_engine_command_gpu_options(kernel):
-    """Engine/GPU options should be accepted only for factorize and consensus."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command")
-    kernel.parse_gpu_args(parser)
-    supported = ("factorize", "consensus")
-
-    # factorize and consensus accept engine/GPU options (no raise)
-    for argv in (
-        ["factorize", "--engine", "gpu"],
-        ["consensus", "--engine", "gpu"],
-        ["consensus", "--gpu-device", "cuda"],
-    ):
-        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
-
-    # non-engine commands carrying engine/GPU options are rejected
-    for argv in (
-        ["prepare", "--engine", "gpu"],
-        ["combine", "--gpu-device", "cuda"],
-        ["k_selection_plot", "--gpu-dtype", "fp32"],
-    ):
-        with pytest.raises(ValueError, match="only valid with"):
-            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
-
-    # non-engine commands without engine/GPU options are fine
-    kernel.validate_engine_args_for_command(parser.parse_args(["prepare"]), supported)
-
-
-# ---------------------------------------------------------------------
-# GPU CLI and cNMF consensus wiring
-# ---------------------------------------------------------------------
-def test_validate_engine_args_accepts_consensus_gpu_options(kernel):
-    """`consensus --engine gpu` and consensus GPU flags should be valid CLI input."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command")
-    kernel.parse_gpu_args(parser)
-    supported = ("factorize", "consensus")
-
-    for argv in (
-        ["consensus", "--engine", "gpu"],
-        ["consensus", "--engine", "gpu", "--gpu-device", "CUDA:0", "--gpu-dtype", "FP32"],
-        ["consensus", "--gpu-allow-tf32", "--gpu-compile"],
-    ):
-        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
-
-
-def test_validate_engine_args_rejects_gpu_options_for_non_engine_commands(kernel):
-    """GPU flags should still be rejected for prepare/combine/k_selection_plot."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("command")
-    kernel.parse_gpu_args(parser)
-    supported = ("factorize", "consensus")
-
-    for argv in (
-        ["prepare", "--engine", "gpu"],
-        ["combine", "--gpu-device", "cuda"],
-        ["k_selection_plot", "--gpu-check-every", "2"],
-    ):
-        with pytest.raises(ValueError, match="only valid with"):
-            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
-
-
-def test_configure_nmf_engine_cpu_leaves_cnmf_instance_unchanged(kernel):
-    """The default CPU engine should be a no-op so existing sklearn behavior is preserved."""
-    class DummyCNMF:
-        def _nmf(self, X, nmf_kwargs):
-            return "sklearn-path"
-
-    obj = DummyCNMF()
-    result = kernel.configure_nmf_engine(obj, engine="cpu", gpu_kwargs={"device": "cuda"})
-
-    assert result is obj
-    assert "_nmf" not in vars(obj)                  # no instance override added
-    assert obj._nmf("X", {}) == "sklearn-path"      # original class method intact
-
-
-def test_configure_nmf_engine_rejects_unknown_engine(kernel):
-    """Unknown engine names should fail loudly instead of silently using CPU."""
-    with pytest.raises(ValueError, match="engine must be 'cpu' or 'gpu'"):
-        kernel.configure_nmf_engine(object(), engine="tpu")
-
-
-def test_configure_nmf_engine_gpu_patches_instance_nmf_with_adapter(kernel, monkeypatch):
-    """The GPU engine should replace the instance `_nmf` callable with the GPU adapter path."""
-    captured = {}
-
-    def fake_nmf_gpu(self, X, nmf_kwargs):
-        captured["self"], captured["X"], captured["nmf_kwargs"] = self, X, dict(nmf_kwargs)
-        return ("spectra", "usages")
-
-    monkeypatch.setattr(kernel, "_nmf_gpu", fake_nmf_gpu)
-
-    class DummyCNMF:
-        def _nmf(self, X, nmf_kwargs):
-            return "sklearn-path"
-
-    obj = DummyCNMF()
-    gpu_kwargs = {"device": "cuda", "dtype": "fp32"}
-    result = kernel.configure_nmf_engine(obj, engine="gpu", gpu_kwargs=gpu_kwargs)
-
-    assert result is obj
-    assert "_nmf" in vars(obj)                                  # instance _nmf is now overridden
-
-    out = obj._nmf("Xdata", {"n_components": 5})
-
-    assert out == ("spectra", "usages")                        # dispatched through the GPU adapter
-    assert captured["self"] is obj and captured["X"] == "Xdata"
-    assert captured["nmf_kwargs"]["engine"] == "gpu"           # engine + gpu kwargs embedded first
-    assert captured["nmf_kwargs"]["gpu"] == gpu_kwargs
-    assert captured["nmf_kwargs"]["n_components"] == 5         # original kwargs preserved
 
 
 # ---------------------------------------------------------------------
@@ -806,7 +633,7 @@ def test_sparse_input_uses_densify_path_and_returns_valid_output(kernel):
     sparse = pytest.importorskip("scipy.sparse")
     X = sparse.csr_matrix(small_nonnegative_matrix(cells=6, genes=5))
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 2, "max_iter": 2, "random_state": 0},
         {"device": "cpu"},
@@ -821,7 +648,7 @@ def test_nndsvd_nndsvda_nndsvdar_initializers_return_valid_outputs(kernel):
     X = small_nonnegative_matrix(cells=8, genes=6)
 
     for init in ("nndsvd", "nndsvda", "nndsvdar"):
-        H, W = kernel.factorize_nmf_gpu(
+        H, W = kernel._nmf_gpu(
             X,
             {"n_components": 3, "max_iter": 1, "random_state": 0, "init": init},
             {"device": "cpu"},
@@ -830,16 +657,495 @@ def test_nndsvd_nndsvda_nndsvdar_initializers_return_valid_outputs(kernel):
 
 
 # ---------------------------------------------------------------------
-# Consensus fixed-H kernel behavior
+# Backend-specific execution behavior
 # ---------------------------------------------------------------------
-def test_factorize_nmf_gpu_update_h_false_keeps_fixed_h_and_updates_only_w(kernel):
+def test_execution_plan_ignores_compile_on_mps_and_uses_eager_path(kernel):
+    """MPS compile requests should resolve to eager execution with check_every cadence."""
+    fake_torch = SimpleNamespace(compile=lambda fn: pytest.fail("compile should be ignored on MPS"))
+    opt = dict(kernel.DEFAULT_GPU, compile=True, check_every=4, compile_block=9)
+
+    step, block = kernel._execution_plan(fake_torch, opt, "mps")
+
+    assert step is kernel._mu_step
+    assert block == 4
+
+
+def test_tf32_flag_is_applied_only_for_cuda_float32_compute(kernel, monkeypatch):
+    """allow_tf32 should not be passed into the fit loop for non-CUDA execution."""
+    require_nmf_runtime()
+    captured = []
+
+    def fake_fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
+        captured.append((tf32, device, Xg.dtype))
+        return W, H
+
+    monkeypatch.setattr(kernel, "_fit_mu", fake_fit_mu)
+    X = small_nonnegative_matrix(cells=4, genes=3)
+
+    kernel._nmf_gpu(
+        X,
+        {"n_components": 2, "max_iter": 1, "random_state": 0},
+        {"device": "cpu", "dtype": "fp32", "allow_tf32": True},
+    )
+
+    assert captured[-1][0] is False
+
+
+def test_tf32_scope_is_noop_off_cuda(kernel):
+    """The TF32 context manager should leave backend globals untouched off CUDA."""
+    class FakeTorch:
+        def __init__(self):
+            self.cuda = SimpleNamespace(is_available=lambda: True)
+            self.backends = SimpleNamespace(
+                cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=False))
+            )
+            self.precision = "highest"
+
+        def get_float32_matmul_precision(self):
+            return self.precision
+
+        def set_float32_matmul_precision(self, value):
+            self.precision = value
+
+    fake = FakeTorch()
+
+    with kernel._cuda_tf32(fake, True, "cpu"):
+        assert fake.backends.cuda.matmul.allow_tf32 is False
+        assert fake.precision == "highest"
+
+    assert fake.backends.cuda.matmul.allow_tf32 is False
+    assert fake.precision == "highest"
+
+
+def test_cuda_fp32_smoke_when_gpu_available(kernel):
+    """CUDA fp32 should run when PyTorch reports CUDA available; no CUDA version is pinned here."""
+    torch = require_nmf_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    X = small_nonnegative_matrix(cells=6, genes=5)
+
+    H, W = kernel._nmf_gpu(
+        X,
+        {"n_components": 2, "max_iter": 2, "random_state": 0},
+        {"device": "cuda", "dtype": "fp32"},
+    )
+
+    assert_valid_nmf_output(X, H, W, 2)
+
+
+def test_cuda_bf16_uses_bf16_storage_and_matmul_when_gpu_available(kernel, monkeypatch):
+    """CUDA bf16 should require CUDA plus PyTorch-reported bf16 device support."""
+    torch = require_nmf_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    if not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA device does not support bf16")
+    captured = []
+
+    def fake_fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
+        captured.append((Xg.dtype, W.dtype, H.dtype, eps.dtype, tf32, device))
+        return W, H
+
+    monkeypatch.setattr(kernel, "_fit_mu", fake_fit_mu)
+    X = small_nonnegative_matrix(cells=4, genes=3)
+
+    kernel._nmf_gpu(
+        X,
+        {"n_components": 2, "max_iter": 1, "random_state": 0},
+        {"device": "cuda", "dtype": "bf16"},
+    )
+
+    assert captured == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.bfloat16, False, "cuda")]
+
+
+def test_cuda_allow_tf32_scope_restores_previous_state_when_gpu_available(kernel):
+    """CUDA TF32 should require CUDA availability and restore global torch matmul settings."""
+    torch = require_nmf_runtime()
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    prev_allow = torch.backends.cuda.matmul.allow_tf32
+    prev_precision = torch.get_float32_matmul_precision()
+
+    with kernel._cuda_tf32(torch, not prev_allow, "cuda"):
+        assert torch.backends.cuda.matmul.allow_tf32 is (not prev_allow)
+
+    assert torch.backends.cuda.matmul.allow_tf32 is prev_allow
+    assert torch.get_float32_matmul_precision() == prev_precision
+
+
+# ---------------------------------------------------------------------
+# Batched-replicate factorize (--gpu-batch): batch-aware kernel parity
+# ---------------------------------------------------------------------
+def _rowwise_cosine(A, B):
+    """Cosine of each aligned program row (same seed -> same init -> same row order, no permutation)."""
+    num = (A * B).sum(axis=1)
+    den = np.linalg.norm(A, axis=1) * np.linalg.norm(B, axis=1) + 1e-30
+    return num / den
+
+
+def test_nmf_gpu_mu_matches_single_kernel_for_each_seed(kernel):
+    """Each batched replicate should match the single-replicate kernel at the same seed."""
+    require_nmf_runtime()
+    k = 3
+    X = low_rank_matrix(rank=k)
+    seeds = [7, 3, 101]
+    nmf_kwargs = {"n_components": k, "max_iter": 300, "tol": 0}
+    gpu_kwargs = {"device": "cpu"}
+
+    batched = kernel._nmf_gpu_mu(X, seeds, nmf_kwargs, gpu_kwargs)
+    assert len(batched) == len(seeds)
+
+    for (Hb, Wb), s in zip(batched, seeds):
+        Hs, Ws = kernel._nmf_gpu(X, dict(nmf_kwargs, random_state=s), gpu_kwargs)
+        assert Hb.shape == Hs.shape and Wb.shape == Ws.shape
+        assert _rowwise_cosine(Hb, Hs).min() > 0.9999
+        rel_b = np.linalg.norm(X - Wb @ Hb) / np.linalg.norm(X)
+        rel_s = np.linalg.norm(X - Ws @ Hs) / np.linalg.norm(X)
+        assert abs(rel_b - rel_s) < 1e-4
+
+
+def test_nmf_gpu_mu_single_seed_reduces_to_single_kernel(kernel):
+    """A batch of one (R=1) must reproduce the single-replicate result at that seed."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=12, genes=6)
+    kw = {"n_components": 2, "max_iter": 80, "tol": 0}
+
+    (Hb, Wb), = kernel._nmf_gpu_mu(X, [5], kw, {"device": "cpu"})
+    Hs, Ws = kernel._nmf_gpu(X, dict(kw, random_state=5), {"device": "cpu"})
+
+    assert Hb.shape == Hs.shape and Wb.shape == Ws.shape
+    assert _rowwise_cosine(Hb, Hs).min() > 0.9999
+
+
+def test_nmf_gpu_mu_distinct_seeds_give_distinct_replicates(kernel):
+    """Distinct seeds should keep replicate outputs distinct."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=20, genes=8)
+
+    out = kernel._nmf_gpu_mu(X, [1, 2], {"n_components": 3, "max_iter": 50}, {"device": "cpu"})
+
+    assert not np.allclose(out[0][0], out[1][0])
+
+
+def test_nmf_gpu_mu_rejects_empty_seeds(kernel):
+    """An empty seed list is a caller error (no replicates to run), not a silent no-op."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=6, genes=4)
+
+    with pytest.raises(ValueError, match="non-empty"):
+        kernel._nmf_gpu_mu(X, [], {"n_components": 2, "max_iter": 1}, {"device": "cpu"})
+
+
+def test_nmf_gpu_mu_results_are_invariant_to_batch_grouping(kernel):
+    """Changing seed grouping should not change per-seed factors."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=16, genes=7)
+    seeds = [4, 11, 29]
+    kw = {"n_components": 3, "max_iter": 150, "tol": 0}
+    gpu = {"device": "cpu"}
+
+    batched = kernel._nmf_gpu_mu(X, seeds, kw, gpu)                  # one launch, R=3
+    assert len(batched) == len(seeds)
+
+    for (Hb, Wb), s in zip(batched, seeds):
+        (Hs, Ws), = kernel._nmf_gpu_mu(X, [s], kw, gpu)             # its own launch, R=1
+        assert Hb.shape == Hs.shape and Wb.shape == Ws.shape
+        assert _rowwise_cosine(Hb, Hs).min() > 0.9999
+        assert _rowwise_cosine(Wb.T, Ws.T).min() > 0.9999
+
+
+def test_fit_mu_is_batch_aware_and_stops_when_all_slices_converge(kernel):
+    """Batched `_fit_mu` should stop only after all slices meet tolerance."""
+    torch = require_nmf_runtime()
+    R = 3
+    Xb = torch.full((1, 3, 2), 2.0, dtype=torch.float64)
+    W = torch.ones((R, 3, 1), dtype=torch.float64)
+    H = torch.ones((R, 1, 2), dtype=torch.float64)
+    eps = torch.tensor(1e-9, dtype=torch.float64)
+    calls = {"count": 0}
+
+    def no_change_step(W, H, Xg, eps):
+        calls["count"] += 1
+        return W, H
+
+    Wout, Hout = kernel._fit_mu(torch, Xb, W, H, eps, 10, 1e-4, no_change_step, 1, False, "cpu")
+
+    assert calls["count"] == 2
+    assert Wout.shape == (R, 3, 1) and Hout.shape == (R, 1, 2)
+
+
+# ---------------------------------------------------------------------
+# Fixed-H consensus refit (batch-aware): keep H fixed, update W only
+# ---------------------------------------------------------------------
+def _fixed_spectra(k, genes, seed=0):
+    """A valid non-negative fixed H (spectra) of shape (k, genes)."""
+    return np.abs(np.random.default_rng(seed).standard_normal((k, genes)))
+
+
+def test_nmf_gpu_fixed_h_keeps_spectra_fixed_and_updates_usages(kernel):
+    """Fixed-H refit should return the supplied H unchanged."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=10, genes=6)
+    k, Hfix = 3, _fixed_spectra(3, 6)
+    kw = {"n_components": k, "max_iter": 50, "H": Hfix, "update_H": False}
+
+    (H, W), = kernel._nmf_gpu_fixed_h(X, [7], kw, {"device": "cpu"})
+
+    assert H.shape == (k, 6) and W.shape == (10, k)
+    assert np.allclose(H, Hfix)
+
+
+def test_nmf_gpu_fixed_h_batched_matches_single_refit_per_seed(kernel):
+    """Each batched fixed-H refit slice should match a single-seed refit."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=12, genes=5)
+    k, Hfix, seeds = 2, _fixed_spectra(2, 5, seed=1), [3, 9]
+    kw = {"n_components": k, "max_iter": 100, "tol": 0, "H": Hfix, "update_H": False}
+
+    batched = kernel._nmf_gpu_fixed_h(X, seeds, kw, {"device": "cpu"})
+    assert len(batched) == len(seeds)
+
+    for (Hb, Wb), s in zip(batched, seeds):
+        (Hs, Ws), = kernel._nmf_gpu_fixed_h(X, [s], kw, {"device": "cpu"})
+        assert np.allclose(Hb, Hfix) and np.allclose(Hs, Hfix)
+        assert _rowwise_cosine(Wb.T, Ws.T).min() > 0.9999
+
+
+def test_nmf_gpu_fixed_h_distinct_seeds_give_distinct_usages(kernel):
+    """Distinct W initializations should keep fixed-H usage outputs distinct."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=14, genes=6)
+    k, Hfix = 3, _fixed_spectra(3, 6, seed=2)
+    kw = {"n_components": k, "max_iter": 40, "H": Hfix, "update_H": False}
+
+    out = kernel._nmf_gpu_fixed_h(X, [1, 2], kw, {"device": "cpu"})
+
+    assert not np.allclose(out[0][1], out[1][1])
+
+
+def test_nmf_gpu_update_H_false_dispatches_to_fixed_h_refit(kernel):
+    """`_nmf_gpu(update_H=False)` should dispatch to the fixed-H refit."""
+    require_nmf_runtime()
+    X = small_nonnegative_matrix(cells=8, genes=4)
+    k, Hfix = 2, _fixed_spectra(2, 4, seed=3)
+
+    H, W = kernel._nmf_gpu(X, {"n_components": k, "max_iter": 20, "H": Hfix, "update_H": False}, {"device": "cpu"})
+
+    assert np.allclose(H, Hfix) and W.shape == (8, k)
+
+
+# ---------------------------------------------------------------------
+# --gpu-batch config plumbing
+# ---------------------------------------------------------------------
+def test_default_gpu_batch_is_single_replicate(kernel):
+    """The default batch is 1, so the single-replicate path is unchanged unless a user opts in."""
+    assert kernel.DEFAULT_GPU["batch"] == 1
+    assert kernel._resolve_gpu_opts(None)["batch"] == 1
+
+
+def test_resolve_gpu_opts_coerces_and_floors_batch_to_at_least_one(kernel):
+    """batch is a positive int: numeric strings coerce and non-positive values floor to 1."""
+    assert kernel._resolve_gpu_opts({"batch": "4"})["batch"] == 4
+    assert kernel._resolve_gpu_opts({"batch": 0})["batch"] == 1
+    assert kernel._resolve_gpu_opts({"batch": -5})["batch"] == 1
+
+
+def test_parse_gpu_args_registers_batch_and_gpu_kwargs_carries_it(kernel):
+    """--gpu-batch parses under --engine gpu and flows into resolved gpu_kwargs; absent -> default 1."""
+    import argparse
+    parser = kernel.parse_gpu_args(argparse.ArgumentParser())
+
+    args = parser.parse_args(["--engine", "gpu", "--gpu-batch", "8"])
+    assert args.gpu_batch == 8
+    assert kernel.gpu_kwargs_from_args(args)["batch"] == 8
+
+    default_args = parser.parse_args(["--engine", "gpu"])
+    assert default_args.gpu_batch is None
+    assert kernel.gpu_kwargs_from_args(default_args)["batch"] == 1
+
+
+# ---------------------------------------------------------------------
+# CLI parsing, engine wiring, and fixed-H consensus refit (integration)
+# ---------------------------------------------------------------------
+def test_parse_gpu_args_defaults_to_none_until_user_sets_engine(kernel):
+    """CLI flags should default to None so absent options are distinguishable from explicit values."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args([])
+
+    assert args.engine is None
+    for name in ("gpu_device", "gpu_dtype", "gpu_allow_tf32", "gpu_compile",
+                 "gpu_eps", "gpu_check_every", "gpu_compile_block"):
+        assert getattr(args, name) is None, f"{name} should default to None"
+
+
+def test_gpu_kwargs_from_args_rejects_gpu_options_without_gpu_engine(kernel):
+    """GPU-specific CLI options should raise unless `--engine gpu` was explicitly selected."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    for argv in (["--gpu-device", "cuda"], ["--engine", "cpu", "--gpu-device", "cuda"]):
+        with pytest.raises(ValueError, match="require --engine gpu"):
+            kernel.gpu_kwargs_from_args(parser.parse_args(argv))
+
+
+def test_gpu_kwargs_from_args_fills_defaults_when_gpu_engine_selected(kernel):
+    """`--engine gpu` alone should resolve missing GPU options from DEFAULT_GPU."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args(["--engine", "gpu"])
+
+    assert kernel.gpu_kwargs_from_args(args) == kernel.DEFAULT_GPU
+
+
+def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
+    """GPU CLI override values should normalize through the same resolver as config dict values."""
+    parser = argparse.ArgumentParser()
+    kernel.parse_gpu_args(parser)
+
+    args = parser.parse_args([
+        "--engine", "gpu",
+        "--gpu-device", "CUDA:0",        # device is lower-cased by _resolve_gpu_opts
+        "--gpu-dtype", "FP32",
+        "--gpu-allow-tf32",              # store_const flags -> True
+        "--gpu-compile",
+        "--gpu-eps", "1e-8",
+        "--gpu-check-every", "5",
+        "--gpu-compile-block", "100",
+    ])
+
+    assert kernel.gpu_kwargs_from_args(args) == {
+        "device": "cuda:0",
+        "dtype": "fp32",
+        "allow_tf32": True,
+        "compile": True,
+        "eps": 1e-8,
+        "check_every": 5,
+        "compile_block": 100,
+        "batch": 1,          # default added; not set on the CLI here
+    }
+
+
+def test_validate_engine_args_for_command_rejects_non_engine_command_gpu_options(kernel):
+    """Engine/GPU options should be accepted only for factorize and consensus."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize", "consensus")
+
+    # factorize and consensus accept engine/GPU options (no raise)
+    for argv in (
+        ["factorize", "--engine", "gpu"],
+        ["consensus", "--engine", "gpu"],
+        ["consensus", "--gpu-device", "cuda"],
+    ):
+        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+    # non-engine commands carrying engine/GPU options are rejected
+    for argv in (
+        ["prepare", "--engine", "gpu"],
+        ["combine", "--gpu-device", "cuda"],
+        ["k_selection_plot", "--gpu-dtype", "fp32"],
+    ):
+        with pytest.raises(ValueError, match="only valid with"):
+            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+    # non-engine commands without engine/GPU options are fine
+    kernel.validate_engine_args_for_command(parser.parse_args(["prepare"]), supported)
+
+
+def test_validate_engine_args_accepts_consensus_gpu_options(kernel):
+    """`consensus --engine gpu` and consensus GPU flags should be valid CLI input."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize", "consensus")
+
+    for argv in (
+        ["consensus", "--engine", "gpu"],
+        ["consensus", "--engine", "gpu", "--gpu-device", "CUDA:0", "--gpu-dtype", "FP32"],
+        ["consensus", "--gpu-allow-tf32", "--gpu-compile"],
+    ):
+        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+
+def test_validate_engine_args_rejects_gpu_options_for_non_engine_commands(kernel):
+    """GPU flags should still be rejected for prepare/combine/k_selection_plot."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize", "consensus")
+
+    for argv in (
+        ["prepare", "--engine", "gpu"],
+        ["combine", "--gpu-device", "cuda"],
+        ["k_selection_plot", "--gpu-check-every", "2"],
+    ):
+        with pytest.raises(ValueError, match="only valid with"):
+            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+
+def test_configure_nmf_engine_cpu_leaves_cnmf_instance_unchanged(kernel):
+    """The default CPU engine should be a no-op so existing sklearn behavior is preserved."""
+    class DummyCNMF:
+        def _nmf(self, X, nmf_kwargs):
+            return "sklearn-path"
+
+    obj = DummyCNMF()
+    result = kernel.configure_nmf_engine(obj, engine="cpu", gpu_kwargs={"device": "cuda"})
+
+    assert result is obj
+    assert "_nmf" not in vars(obj)                  # no instance override added
+    assert obj._nmf("X", {}) == "sklearn-path"
+
+
+def test_configure_nmf_engine_rejects_unknown_engine(kernel):
+    """Unknown engine names should fail loudly instead of silently using CPU."""
+    with pytest.raises(ValueError, match="engine must be 'cpu' or 'gpu'"):
+        kernel.configure_nmf_engine(object(), engine="tpu")
+
+
+def test_configure_nmf_engine_gpu_patches_instance_nmf_with_adapter(kernel, monkeypatch):
+    """The GPU engine should replace the instance `_nmf` callable with the GPU adapter path."""
+    captured = {}
+
+    def fake_nmf_gpu(self, X, nmf_kwargs):
+        captured["self"], captured["X"], captured["nmf_kwargs"] = self, X, dict(nmf_kwargs)
+        return ("spectra", "usages")
+
+    monkeypatch.setattr(kernel, "nmf_gpu", fake_nmf_gpu)
+
+    class DummyCNMF:
+        def _nmf(self, X, nmf_kwargs):
+            return "sklearn-path"
+
+    obj = DummyCNMF()
+    gpu_kwargs = {"device": "cuda", "dtype": "fp32"}
+    result = kernel.configure_nmf_engine(obj, engine="gpu", gpu_kwargs=gpu_kwargs)
+
+    assert result is obj
+    assert "_nmf" in vars(obj)                                  # instance _nmf is now overridden
+
+    out = obj._nmf("Xdata", {"n_components": 5})
+
+    assert out == ("spectra", "usages")                        # dispatched through the GPU adapter
+    assert captured["self"] is obj and captured["X"] == "Xdata"
+    assert captured["nmf_kwargs"]["engine"] == "gpu"           # engine + gpu kwargs embedded first
+    assert captured["nmf_kwargs"]["gpu"] == gpu_kwargs
+    assert captured["nmf_kwargs"]["n_components"] == 5
+
+
+def test_nmf_gpu_update_h_false_reconstructs_and_keeps_fixed_h(kernel):
     """Consensus refit should preserve supplied H and optimize usages W only."""
     require_nmf_runtime()
     fixed_h = np.array([[1.0, 0.3, 0.6], [0.2, 1.1, 0.4]], dtype=np.float64)
     true_w = np.array([[1.0, 0.5], [0.4, 1.2], [1.5, 0.3], [0.7, 0.9]], dtype=np.float64)
     X = true_w @ fixed_h
 
-    H, W = kernel.factorize_nmf_gpu(
+    H, W = kernel._nmf_gpu(
         X,
         {"n_components": 2, "max_iter": 5, "random_state": 0, "update_H": False, "H": fixed_h},
         {"device": "cpu", "dtype": "fp64", "check_every": 5},
@@ -919,121 +1225,3 @@ def test_execution_plan_for_fixed_h_compile_uses_fixed_h_step_and_compile_block(
     assert calls == [kernel._mu_step_fixed_h]
     assert step is kernel._mu_step_fixed_h
     assert block == 3
-
-
-# ---------------------------------------------------------------------
-# Backend-specific execution behavior
-# ---------------------------------------------------------------------
-def test_execution_plan_ignores_compile_on_mps_and_uses_eager_path(kernel):
-    """MPS compile requests should resolve to eager execution with check_every cadence."""
-    fake_torch = SimpleNamespace(compile=lambda fn: pytest.fail("compile should be ignored on MPS"))
-    opt = dict(kernel.DEFAULT_GPU, compile=True, check_every=4, compile_block=9)
-
-    step, block = kernel._execution_plan(fake_torch, opt, "mps")
-
-    assert step is kernel._mu_step
-    assert block == 4
-
-
-def test_tf32_flag_is_applied_only_for_cuda_float32_compute(kernel, monkeypatch):
-    """allow_tf32 should not be passed into the fit loop for non-CUDA execution."""
-    require_nmf_runtime()
-    captured = []
-
-    def fake_fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
-        captured.append((tf32, device, Xg.dtype))
-        return W, H
-
-    monkeypatch.setattr(kernel, "_fit_mu", fake_fit_mu)
-    X = small_nonnegative_matrix(cells=4, genes=3)
-
-    kernel.factorize_nmf_gpu(
-        X,
-        {"n_components": 2, "max_iter": 1, "random_state": 0},
-        {"device": "cpu", "dtype": "fp32", "allow_tf32": True},
-    )
-
-    assert captured[-1][0] is False
-
-
-def test_tf32_scope_is_noop_off_cuda(kernel):
-    """The TF32 context manager should leave backend globals untouched off CUDA."""
-    class FakeTorch:
-        def __init__(self):
-            self.cuda = SimpleNamespace(is_available=lambda: True)
-            self.backends = SimpleNamespace(
-                cuda=SimpleNamespace(matmul=SimpleNamespace(allow_tf32=False))
-            )
-            self.precision = "highest"
-
-        def get_float32_matmul_precision(self):
-            return self.precision
-
-        def set_float32_matmul_precision(self, value):
-            self.precision = value
-
-    fake = FakeTorch()
-
-    with kernel._cuda_tf32(fake, True, "cpu"):
-        assert fake.backends.cuda.matmul.allow_tf32 is False
-        assert fake.precision == "highest"
-
-    assert fake.backends.cuda.matmul.allow_tf32 is False
-    assert fake.precision == "highest"
-
-
-def test_cuda_fp32_smoke_when_gpu_available(kernel):
-    """CUDA fp32 should run when PyTorch reports CUDA available; no CUDA version is pinned here."""
-    torch = require_nmf_runtime()
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is not available")
-    X = small_nonnegative_matrix(cells=6, genes=5)
-
-    H, W = kernel.factorize_nmf_gpu(
-        X,
-        {"n_components": 2, "max_iter": 2, "random_state": 0},
-        {"device": "cuda", "dtype": "fp32"},
-    )
-
-    assert_valid_nmf_output(X, H, W, 2)
-
-
-def test_cuda_bf16_uses_bf16_storage_and_matmul_when_gpu_available(kernel, monkeypatch):
-    """CUDA bf16 should require CUDA plus PyTorch-reported bf16 device support."""
-    torch = require_nmf_runtime()
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is not available")
-    if not torch.cuda.is_bf16_supported():
-        pytest.skip("CUDA device does not support bf16")
-    captured = []
-
-    def fake_fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
-        captured.append((Xg.dtype, W.dtype, H.dtype, eps.dtype, tf32, device))
-        return W, H
-
-    monkeypatch.setattr(kernel, "_fit_mu", fake_fit_mu)
-    X = small_nonnegative_matrix(cells=4, genes=3)
-
-    kernel.factorize_nmf_gpu(
-        X,
-        {"n_components": 2, "max_iter": 1, "random_state": 0},
-        {"device": "cuda", "dtype": "bf16"},
-    )
-
-    assert captured == [(torch.bfloat16, torch.bfloat16, torch.bfloat16, torch.bfloat16, False, "cuda")]
-
-
-def test_cuda_allow_tf32_scope_restores_previous_state_when_gpu_available(kernel):
-    """CUDA TF32 should require CUDA availability and restore global torch matmul settings."""
-    torch = require_nmf_runtime()
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is not available")
-
-    prev_allow = torch.backends.cuda.matmul.allow_tf32
-    prev_precision = torch.get_float32_matmul_precision()
-
-    with kernel._cuda_tf32(torch, not prev_allow, "cuda"):
-        assert torch.backends.cuda.matmul.allow_tf32 is (not prev_allow)
-
-    assert torch.backends.cuda.matmul.allow_tf32 is prev_allow
-    assert torch.get_float32_matmul_precision() == prev_precision

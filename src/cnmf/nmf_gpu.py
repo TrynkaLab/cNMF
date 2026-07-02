@@ -1,63 +1,39 @@
 #!/usr/bin/env python
-"""GPU NMF kernel — raw-PyTorch Frobenius multiplicative-update (MU) factorization.
+"""PyTorch Frobenius-MU NMF backend for cNMF.
 
-Standalone (no cnmf dependency); exposes a core NMF factorization and a thin `cNMF._nmf` adapter.
+The kernel is cNMF-compatible: it returns `(spectra, usages) = (H, W)` as numpy
+float64, while compute dtype/device are controlled by `gpu_kwargs`.
 
-nmf_kwargs (from cnmf): reads n_components, max_iter, tol, random_state, init, and
-  consensus refit args H/update_H.
-  Ignores beta_loss/solver/alpha_W/alpha_H/l1_ratio by design — always Frobenius MU, no regularization
-  (matches cnmf defaults; would diverge if a run enables regularization). Defaults are centralized in
-  `DEFAULT_NMF` and `DEFAULT_GPU`. Init runs through sklearn's _initialize_nmf for parity
-  (random|nndsvd|nndsvda|nndsvdar; None uses `DEFAULT_NMF["init"]`; 'custom' unsupported).
+Supported runtime options:
+    device: auto|cuda|cuda:N|mps|cpu     auto = CUDA -> MPS -> CPU
+    dtype:  auto|fp32|fp64|bf16          auto = fp64 on CPU, fp32 on GPU
+    allow_tf32, compile, eps, check_every, compile_block, batch
 
-gpu_kwargs (from Nextflow config): precedence gpu_kwargs dict > `DEFAULT_GPU`.
-    device        auto|cuda|cuda:N|mps|cpu
-    dtype         auto|fp32|fp64|bf16
-    allow_tf32    TF32 for CUDA fp32 matmul
-    compile       torch.compile the MU step      (CPU/CUDA; ignored on MPS)
-    eps           MU denominator guard, stored in compute dtype
-    check_every   iters/block when eager
-    compile_block iters/block when compiled
-
-Resolution — auto adapts silently; an explicit-but-unavailable value RAISES:
-    device : auto = CUDA->MPS->CPU;            explicit cuda/mps unavailable -> error
-    dtype  : auto = fp64 on CPU, fp32 on GPU;  explicit fp64 on MPS         -> error
-             bf16 is explicit CUDA-only experimental storage + matmul dtype
-
-    device   storage(default)
-    ------   ----------------
-    CPU      fp64    (stable CPU reference)
-    CUDA     fp32    (bf16 is explicit experimental storage/matmul; TF32 is for fp32 matmul)
-    MPS      fp32    (no fp64 in hardware)
-
-Convergence (relative drop in ||X-WH|| < tol) is checked once per block, between blocks. Eager runs
-short blocks (check_every) for a responsive dynamic stop; compiled runs fixed compile_block-sized
-blocks (the host sync that reads the error stays outside the compiled region) and so converges
-tighter for the same tol.
-
-allow_tf32 is a CUDA fp32-matmul performance preference (not a storage dtype), scoped to the
-factorization and restored on exit; it is silently ignored where unsupported. compile is allowed on
-CPU/CUDA and ignored on MPS. TF32 under compile also flips float32_matmul_precision to 'high', the
-knob the inductor backend honors. bf16 uses bf16 storage and bf16 matmul; it is not fp32 storage with
-bf16 temporary casts. Input X must be non-negative & finite.
-Output dtype contract: returned arrays are float64 for compatibility; numerical accuracy is set by
-the compute dtype.
+Explicit unavailable GPUs raise instead of falling back to CPU. MPS is fp32-only
+for this kernel; bf16 is explicit CUDA-only storage and matmul. The implementation
+also supports batched same-k replicates for factorize and fixed-H consensus refits.
 """
 import contextlib
+import functools
+from collections import namedtuple
 
 import numpy as np
 
 
 # ---------------------------------------------------------------------
-# Defaults and option parsing
+# Defaults
 # ---------------------------------------------------------------------
+
+
 _TRUTHY = {"1", "true", "yes", "on"}
+
 
 DEFAULT_NMF = {
     "max_iter": 1000,
     "tol": 1e-4,
     "init": "random",
 }
+
 
 DEFAULT_GPU = {
     "device": "auto",
@@ -67,7 +43,13 @@ DEFAULT_GPU = {
     "eps": 1e-9,
     "check_every": 10,
     "compile_block": 1,
+    "batch": 1,             # factorize replicates per launch
 }
+
+
+# ---------------------------------------------------------------------
+# CLI argument parsing and option resolution
+# ---------------------------------------------------------------------
 
 
 def parse_gpu_args(parser):
@@ -81,6 +63,7 @@ def parse_gpu_args(parser):
     group.add_argument("--gpu-eps", type=float, help="[factorize,consensus,gpu] Multiplicative-update denominator guard")
     group.add_argument("--gpu-check-every", type=int, help="[factorize,consensus,gpu] Eager-mode convergence check interval")
     group.add_argument("--gpu-compile-block", type=int, help="[factorize,consensus,gpu] Number of MU iterations per compiled block")
+    group.add_argument("--gpu-batch", type=int, help="[factorize] Replicates run per GPU launch (batched MU); 1 = single-replicate")
     return parser
 
 
@@ -94,6 +77,7 @@ def gpu_kwargs_from_args(args):
         "eps": args.gpu_eps,
         "check_every": args.gpu_check_every,
         "compile_block": args.gpu_compile_block,
+        "batch": args.gpu_batch,
     }
     if args.engine != "gpu":
         if any(value is not None for value in raw.values()):
@@ -117,27 +101,11 @@ def validate_engine_args_for_command(args, available_commands):
         "gpu_eps",
         "gpu_check_every",
         "gpu_compile_block",
+        "gpu_batch",
     ]
     if any(getattr(args, name) is not None for name in gpu_arg_names):
         commands = ", ".join(available_commands)
         raise ValueError(f"NMF engine/GPU options are only valid with: {commands}")
-
-
-def configure_nmf_engine(cnmf_obj, engine="cpu", gpu_kwargs=None):
-    """Configure a cNMF instance with an optional GPU NMF adapter."""
-    if engine not in ("cpu", "gpu"):
-        raise ValueError("engine must be 'cpu' or 'gpu'")
-    if engine == "cpu":
-        return cnmf_obj
-
-    def _gpu_nmf(X, nmf_kwargs):
-        nmf_kwargs = dict(nmf_kwargs)
-        nmf_kwargs["engine"] = "gpu"
-        nmf_kwargs["gpu"] = gpu_kwargs or {}
-        return _nmf_gpu(cnmf_obj, X, nmf_kwargs)
-
-    cnmf_obj._nmf = _gpu_nmf
-    return cnmf_obj
 
 
 def _resolve_gpu_opts(gpu_kwargs):
@@ -162,14 +130,17 @@ def _resolve_gpu_opts(gpu_kwargs):
         eps           = parse_typed(raw.get("eps"), DEFAULT_GPU["eps"], float),
         check_every   = parse_positive_int(raw.get("check_every"), DEFAULT_GPU["check_every"]),
         compile_block = parse_positive_int(raw.get("compile_block"), DEFAULT_GPU["compile_block"]),
+        batch         = parse_positive_int(raw.get("batch"), DEFAULT_GPU["batch"]),
     )
 
 
 # ---------------------------------------------------------------------
-# Runtime backend selection
+# Runtime backend selection (device / dtype / TF32)
 # ---------------------------------------------------------------------
+
+
 def _select_device(torch, requested):
-    """auto = CUDA->MPS->CPU; an explicit GPU that's unavailable raises (never a silent slow-CPU)."""
+    """Resolve device, raising for explicit unavailable CUDA/MPS requests."""
     gpu_availability = {
         "cuda": torch.cuda.is_available,
         "mps": torch.backends.mps.is_available,
@@ -193,7 +164,7 @@ def _select_device(torch, requested):
 
 
 def _select_storage(torch, requested, device):
-    """auto = fp64 on CPU, fp32 on GPU; bf16 is explicit CUDA-only experimental storage."""
+    """Resolve storage/matmul dtype for the selected device."""
     base = device.split(":")[0]
     dtype_map = {
         "fp32": torch.float32,
@@ -225,10 +196,7 @@ def _select_storage(torch, requested, device):
 
 @contextlib.contextmanager
 def _cuda_tf32(torch, enable, device):
-    """Scope CUDA TF32 fp32-matmul to `enable`, restoring the previous globals on exit (no-op off
-    CUDA). Flips BOTH backends.cuda.matmul.allow_tf32 and float32_matmul_precision — the latter is
-    what torch.compile's inductor backend honors. TF32 only affects fp32 matmul and is silently
-    ignored by pre-Ampere hardware."""
+    """Temporarily set CUDA TF32 matmul flags; no-op off CUDA."""
     if not device.startswith("cuda") or not torch.cuda.is_available():
         yield
         return
@@ -244,8 +212,10 @@ def _cuda_tf32(torch, enable, device):
 
 
 # ---------------------------------------------------------------------
-# Input validation, loud imports, and initialization
+# Input validation, lazy imports, and initialization
 # ---------------------------------------------------------------------
+
+
 def _to_checked_array(X):
     """Materialize X dense and enforce the NMF preconditions: finite and non-negative."""
     # TODO: sparse RAM path. Sparse X is still densified by this prototype; add a dense-size
@@ -260,6 +230,22 @@ def _to_checked_array(X):
     if Xnp.size and Xnp.min() < 0:
         raise ValueError(f"NMF requires non-negative input X; found min(X) = {float(Xnp.min()):.4g}")
     return np.ascontiguousarray(Xnp)
+
+
+def _to_checked_fixed_h(H, k, n_features):
+    """Materialize and validate fixed H for update_H=False consensus refits."""
+    if H is None:
+        raise ValueError("update_H=False requires a fixed H matrix")
+    Hnp = H.toarray() if hasattr(H, "toarray") else np.asarray(H)
+    if Hnp.ndim != 2:
+        raise ValueError("fixed H must be a 2D matrix")
+    if Hnp.shape != (k, n_features):
+        raise ValueError(f"fixed H shape must be ({k}, {n_features}); got {Hnp.shape}")
+    if not np.isfinite(Hnp).all():
+        raise ValueError("fixed H contains NaN/inf")
+    if Hnp.size and Hnp.min() < 0:
+        raise ValueError(f"NMF requires non-negative fixed H; found min(H) = {float(Hnp.min()):.4g}")
+    return Hnp
 
 
 def _loud_import_torch():
@@ -300,12 +286,10 @@ def _loud_import_initialize_nmf():
 
 
 def _init_wh(Xnp, k, seed, init):
-    """sklearn-parity init via _initialize_nmf -> (W0, H0) as numpy. `init` None uses the centralized
-    NMF default. Explicit random|nndsvd|nndsvda|nndsvdar pass through; 'custom' is unsupported
-    (supply W/H yourself)."""
+    """Initialize W/H with sklearn parity; `init=None` uses DEFAULT_NMF."""
     if init == "custom":
         raise NotImplementedError("nmf_gpu does not support init='custom'")
-    _initialize_nmf = _loud_import_initialize_nmf()      # private, but pinned by the cnmf-parity goal
+    _initialize_nmf = _loud_import_initialize_nmf()
     return _initialize_nmf(
         Xnp,
         n_components=k,
@@ -315,75 +299,38 @@ def _init_wh(Xnp, k, seed, init):
 
 
 # ---------------------------------------------------------------------
-# Multiplicative-update kernel and execution plan
+# Multiplicative-update steppers (one MU iteration; batch-aware)
 # ---------------------------------------------------------------------
+
+
 def _mu_step(W, H, Xg, eps):
-    """One functional Frobenius MU update — W first (old H), then H (new W), matching the update
-    order of sklearn's `_fit_multiplicative_update` (update W, then H using the just-updated W).
-    Out-of-place (no `*=`) so torch.compile can trace it; grouped as factor*(num/den) for stable
-    rounding. Σ_b over cell-blocks collapses to these dense matmuls."""
-    W = W * ((Xg @ H.T) / (W @ (H @ H.T) + eps))           # W *= XHᵀ / (W·HHᵀ)   (uses old H)
-    H = H * ((W.T @ Xg) / ((W.T @ W) @ H + eps))           # H *= WᵀX / (WᵀW·H)   (uses new W)
+    """One MU update, sklearn order: update W from old H, then H from new W.
+
+    Accepts either 2D single-replicate tensors or stacked `[R,...]` replicate
+    tensors with shared `Xg[1,n,g]`. Operations are out-of-place for compile.
+    """
+    Ht = H.transpose(-2, -1)                               # [g,k] or [R,g,k]
+    W = W * ((Xg @ Ht) / (W @ (H @ Ht) + eps))            # W *= XHᵀ / (W·HHᵀ)   (uses old H)
+    Wt = W.transpose(-2, -1)                               # [k,n] or [R,k,n]
+    H = H * ((Wt @ Xg) / ((Wt @ W) @ H + eps))            # H *= WᵀX / (WᵀW·H)   (uses new W)
     return W, H
 
 
 def _mu_step_fixed_h(W, H, Xg, eps):
-    """One Frobenius MU update for consensus refit: keep H fixed and update W only."""
-    return W * ((Xg @ H.T) / (W @ (H @ H.T) + eps))
+    """One fixed-H MU update; only W changes. Supports 2D or stacked W."""
+    Ht = H.transpose(-2, -1)                               # [g,k] or [1,g,k]
+    return W * ((Xg @ Ht) / (W @ (H @ Ht) + eps))
 
 
-def _execution_plan(torch, opt, device, step_fn=_mu_step):
-    """Resolve compile policy and convergence-check cadence in one place.
-
-    MPS does not support torch.compile reliably for this path, so compile requests are treated as
-    eager there. CPU/CUDA compile is allowed. Compiled runs use compile_block because the host sync
-    for convergence checks must stay outside the compiled step; eager runs use check_every for
-    responsive stopping.
-    """
-    use_compile = opt["compile"] and not device.startswith("mps")
-    if use_compile:
-        return torch.compile(step_fn), opt["compile_block"]
-    return step_fn, opt["check_every"]
-
-
-def _to_device_factors(torch, W0, H0, dtype, device):
-    """Move initialized numpy factors to the selected runtime backend."""
-    W = torch.as_tensor(np.ascontiguousarray(W0), dtype=dtype, device=device)        # usages  (cells x k)
-    H = torch.as_tensor(np.ascontiguousarray(H0), dtype=dtype, device=device)        # spectra (k x genes)
-    return W, H
-
-
-def _to_device_eps(torch, eps, dtype, device):
-    """Move the MU denominator guard to the same dtype/device as X/W/H."""
-    return torch.tensor(eps, dtype=dtype, device=device)
-
-
-def _check_runtime_tensors(Xg, W, H, eps):
-    """Ensure storage dtype is also the matmul dtype for the MU loop."""
-    dtypes = {Xg.dtype, W.dtype, H.dtype, eps.dtype}
-    if len(dtypes) != 1:
-        raise RuntimeError(f"NMF runtime tensors must share dtype; got {sorted(map(str, dtypes))}")
-
-
-def _to_checked_fixed_h(H, k, n_features):
-    """Materialize and validate fixed H for update_H=False consensus refits."""
-    if H is None:
-        raise ValueError("update_H=False requires a fixed H matrix")
-    Hnp = H.toarray() if hasattr(H, "toarray") else np.asarray(H)
-    if Hnp.ndim != 2:
-        raise ValueError("fixed H must be a 2D matrix")
-    if Hnp.shape != (k, n_features):
-        raise ValueError(f"fixed H shape must be ({k}, {n_features}); got {Hnp.shape}")
-    if not np.isfinite(Hnp).all():
-        raise ValueError("fixed H contains NaN/inf")
-    if Hnp.size and Hnp.min() < 0:
-        raise ValueError(f"NMF requires non-negative fixed H; found min(H) = {float(Hnp.min()):.4g}")
-    return Hnp
+# ---------------------------------------------------------------------
+# MU fit loops (iterate to convergence; batch-aware)
+# ---------------------------------------------------------------------
 
 
 def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
-    """Run Frobenius MU updates until convergence or max_iter."""
+    """Run full MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
+    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -392,21 +339,19 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
             for _ in range(n):                             # MU updates run inside the (compiled) step
                 W, H = step(W, H, Xg, eps)
             it += n
-            # stop on relative drop in direct ||X-WH|| < tol (host sync stays outside the compiled step)
-            err = float(torch.linalg.norm(Xg - W @ H))
+            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
             if err_init is None:
-                err_init = err
-                if err_init == 0.0:                # degenerate (e.g. all-zero X): nothing to factor, avoid 0/0
-                    break
-            elif prev_err is not None and (prev_err - err) / err_init < tol:
+                err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
+            elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
                 break
             prev_err = err
     return W, H
 
 
 def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
-    """Run Frobenius MU updates for W with H fixed."""
+    """Run fixed-H MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
+    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -415,90 +360,212 @@ def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, devi
             for _ in range(n):
                 W = step(W, H, Xg, eps)
             it += n
-            err = float(torch.linalg.norm(Xg - W @ H))
+            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
             if err_init is None:
-                err_init = err
-                if err_init == 0.0:
-                    break
-            elif prev_err is not None and (prev_err - err) / err_init < tol:
+                err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
+            elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
                 break
             prev_err = err
     return W
 
 
 # ---------------------------------------------------------------------
-# Public API and adapters
+# Execution plan, run context, and device-tensor helpers
 # ---------------------------------------------------------------------
+
+
+def _execution_plan(torch, opt, device, step_fn=_mu_step):
+    """Return `(step_fn, block_size)` for eager or compiled execution."""
+    use_compile = opt["compile"] and not device.startswith("mps")
+    if use_compile:
+        return torch.compile(step_fn), opt["compile_block"]
+    return step_fn, opt["check_every"]
+
+
+# Runtime context resolved once per factorize call.
+_GpuRun = namedtuple("_GpuRun", "opt device dtype k max_iter tol eps Xnp")
+
+
+def _gpu_setup(torch, X, nmf_kwargs, gpu_kwargs):
+    """Validate common inputs and resolve device, dtype, eps, k, max_iter, and tol."""
+    opt = _resolve_gpu_opts(gpu_kwargs)
+    device = _select_device(torch, opt["device"])
+    dtype = _select_storage(torch, opt["dtype"], device)
+    k = int(nmf_kwargs["n_components"])
+    if k < 1:
+        raise ValueError("n_components must be >= 1")
+    max_iter = int(nmf_kwargs.get("max_iter", DEFAULT_NMF["max_iter"]))
+    tol = float(nmf_kwargs.get("tol", DEFAULT_NMF["tol"]))
+    eps = _to_device_eps(torch, opt["eps"], dtype, device)
+    Xnp = _to_checked_array(X)
+    return _GpuRun(opt, device, dtype, k, max_iter, tol, eps, Xnp)
+
+
+def _want_tf32(torch, rc):
+    """TF32 applies only to explicitly-allowed CUDA fp32 matmul."""
+    return rc.device.startswith("cuda") and rc.opt["allow_tf32"] and rc.dtype is torch.float32
+
+
+def _to_device_factors(torch, W0, H0, dtype, device):
+    """Move initialized factors to runtime dtype/device."""
+    W = torch.as_tensor(np.ascontiguousarray(W0), dtype=dtype, device=device)        # usages  (cells x k)
+    H = torch.as_tensor(np.ascontiguousarray(H0), dtype=dtype, device=device)        # spectra (k x genes)
+    return W, H
+
+
+def _to_device_eps(torch, eps, dtype, device):
+    """Create the MU denominator guard on runtime dtype/device."""
+    return torch.tensor(eps, dtype=dtype, device=device)
+
+
 def _to_nmf_output(H, W):
     """Return spectra/usages as numpy float64 for compatibility; compute precision is unchanged."""
     return H.cpu().double().numpy(), W.cpu().double().numpy()
 
 
-def _factorize_nmf_gpu_fixed_h(torch, Xnp, Xg, nmf_kwargs, opt, device, dtype, k, max_iter, tol, eps, seed):
-    """Consensus refit path: use fixed H and update W only."""
-    Hnp = _to_checked_fixed_h(nmf_kwargs.get("H"), k, Xnp.shape[1])
-
-    W0, _ = _init_wh(Xnp, k, seed, nmf_kwargs.get("init"))
-    W, H = _to_device_factors(torch, W0, Hnp, dtype, device)
-
-    step, block = _execution_plan(torch, opt, device, _mu_step_fixed_h)
-    tf32 = device.startswith("cuda") and opt["allow_tf32"] and dtype is torch.float32
-
-    W = _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device)
-    return _to_nmf_output(H, W)
+def _check_runtime_tensors(Xg, W, H, eps):
+    """Require one dtype across X/W/H/eps."""
+    dtypes = {Xg.dtype, W.dtype, H.dtype, eps.dtype}
+    if len(dtypes) != 1:
+        raise RuntimeError(f"NMF runtime tensors must share dtype; got {sorted(map(str, dtypes))}")
 
 
-def _factorize_nmf_gpu_full(torch, Xnp, Xg, nmf_kwargs, opt, device, dtype, k, max_iter, tol, eps, seed):
-    """Normal NMF path: initialize and update both W and H."""
-    # sklearn-parity init on CPU (_initialize_nmf), then move to device (cnmf uses init='random')
-    W0, H0 = _init_wh(Xnp, k, seed, nmf_kwargs.get("init"))
-    W, H = _to_device_factors(torch, W0, H0, dtype, device)
-
-    step, block = _execution_plan(torch, opt, device)
-    tf32 = device.startswith("cuda") and opt["allow_tf32"] and dtype is torch.float32
-
-    W, H = _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device)
-    return _to_nmf_output(H, W)
+# ---------------------------------------------------------------------
+# NMF kernels (batch-aware; R>=1 replicates per launch, R=1 = single instance)
+# ---------------------------------------------------------------------
 
 
-def factorize_nmf_gpu(X, nmf_kwargs, gpu_kwargs=None):
-    """Standalone Frobenius MU NMF: X -> (spectra, usages) = (H, W).
-
-    CUDA is optional: CPU and MPS paths do not require CUDA. CUDA execution
-    requires an installed PyTorch build where `torch.cuda.is_available()` is
-    true; this function does not pin a CUDA toolkit/runtime version itself.
-    Explicit `dtype='bf16'` additionally requires PyTorch to report
-    `torch.cuda.is_bf16_supported()` for the selected CUDA device.
-    """
+def _nmf_gpu_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+    """Run same-X, same-k MU replicates in one launch; return one `(H, W)` per seed."""
     torch = _loud_import_torch()
 
-    opt = _resolve_gpu_opts(gpu_kwargs)
-    device = _select_device(torch, opt["device"])
-    dtype = _select_storage(torch, opt["dtype"], device)
+    seeds = [None if s is None else int(s) for s in seeds]
+    if not seeds:
+        raise ValueError("seeds must be a non-empty list of per-replicate random states")
 
-    k        = int(nmf_kwargs["n_components"])
-    if k < 1:
-        raise ValueError("n_components must be >= 1")
-    max_iter = int(nmf_kwargs.get("max_iter", DEFAULT_NMF["max_iter"]))
-    tol      = float(nmf_kwargs.get("tol", DEFAULT_NMF["tol"]))
-    eps      = _to_device_eps(torch, opt["eps"], dtype, device)
-    seed     = nmf_kwargs.get("random_state", None)
+    rc = _gpu_setup(torch, X, nmf_kwargs, gpu_kwargs)
+    init = nmf_kwargs.get("init")
+    # TODO: stream sparse/row-blocked X instead of requiring full dense X in RAM/VRAM.
+    Xb = torch.as_tensor(rc.Xnp, dtype=rc.dtype, device=rc.device).unsqueeze(0)      # [1, n, g] shared
 
-    Xnp = _to_checked_array(X)
-    # TODO: sparse VRAM path. This prototype copies dense X to device; future row-blocked/sparse MU
-    # should stream X blocks to GPU/MPS instead of requiring full dense X in VRAM.
-    Xg = torch.as_tensor(Xnp, dtype=dtype, device=device)                            # cells x genes
+    # Initialize each replicate independently, then stack.
+    Ws, Hs = [], []
+    for s in seeds:
+        W0, H0 = _init_wh(rc.Xnp, rc.k, s, init)                                     # (usages, spectra)
+        Ws.append(np.ascontiguousarray(W0)); Hs.append(np.ascontiguousarray(H0))
+    W = torch.as_tensor(np.stack(Ws, 0), dtype=rc.dtype, device=rc.device)          # [R, n, k]
+    H = torch.as_tensor(np.stack(Hs, 0), dtype=rc.dtype, device=rc.device)          # [R, k, g]
 
-    if nmf_kwargs.get("update_H", True) is False:
-        return _factorize_nmf_gpu_fixed_h(torch, Xnp, Xg, nmf_kwargs, opt, device, dtype,
-                                          k, max_iter, tol, eps, seed)
-    return _factorize_nmf_gpu_full(torch, Xnp, Xg, nmf_kwargs, opt, device, dtype,
-                                   k, max_iter, tol, eps, seed)
+    step, block = _execution_plan(torch, rc.opt, rc.device)
+    W, H = _fit_mu(torch, Xb, W, H, rc.eps, rc.max_iter, rc.tol, step, block, _want_tf32(torch, rc), rc.device)
+
+    Hc = H.cpu().double().numpy(); Wc = W.cpu().double().numpy()
+    return [(Hc[r], Wc[r]) for r in range(len(seeds))]
 
 
-def _nmf_gpu(self, X, nmf_kwargs):
-    """cNMF adapter: same core NMF kernel, with `self` ignored for monkeypatch compatibility."""
+def _nmf_gpu_fixed_h(X, seeds, nmf_kwargs, gpu_kwargs=None):
+    """Run fixed-H consensus refits in one launch; return one `(H, W)` per seed."""
+    torch = _loud_import_torch()
+
+    seeds = [None if s is None else int(s) for s in seeds]
+    if not seeds:
+        raise ValueError("seeds must be a non-empty list of per-replicate random states")
+
+    rc = _gpu_setup(torch, X, nmf_kwargs, gpu_kwargs)
+    init = nmf_kwargs.get("init")
+    Hnp = _to_checked_fixed_h(nmf_kwargs.get("H"), rc.k, rc.Xnp.shape[1])             # fixed spectra [k, g]
+    Xb = torch.as_tensor(rc.Xnp, dtype=rc.dtype, device=rc.device).unsqueeze(0)      # [1, n, g] shared
+
+    # Initialize W independently per seed; share fixed H across slices.
+    Ws = []
+    for s in seeds:
+        W0, _ = _init_wh(rc.Xnp, rc.k, s, init)
+        Ws.append(np.ascontiguousarray(W0))
+    W = torch.as_tensor(np.stack(Ws, 0), dtype=rc.dtype, device=rc.device)           # [R, n, k]
+    H = torch.as_tensor(np.ascontiguousarray(Hnp), dtype=rc.dtype, device=rc.device).unsqueeze(0)  # [1, k, g] fixed
+
+    step, block = _execution_plan(torch, rc.opt, rc.device, _mu_step_fixed_h)
+    W = _fit_mu_fixed_h(torch, Xb, W, H, rc.eps, rc.max_iter, rc.tol, step, block, _want_tf32(torch, rc), rc.device)
+
+    Hc = H.squeeze(0).cpu().double().numpy()                                         # shared fixed spectra [k, g]
+    Wc = W.cpu().double().numpy()
+    return [(Hc, Wc[r]) for r in range(len(seeds))]
+
+
+def _nmf_gpu(X, nmf_kwargs, gpu_kwargs=None):
+    """Single-replicate NMF API; dispatches to full MU or fixed-H refit."""
+    kernel = _nmf_gpu_fixed_h if nmf_kwargs.get("update_H", True) is False else _nmf_gpu_mu
+    (result,) = kernel(X, [nmf_kwargs.get("random_state")], nmf_kwargs, gpu_kwargs)
+    return result
+
+
+# ---------------------------------------------------------------------
+# cNMF integration: engine wiring and adapters
+# ---------------------------------------------------------------------
+
+
+def configure_nmf_engine(cnmf_obj, engine="cpu", gpu_kwargs=None):
+    """Install GPU `_nmf` and batched factorize hooks on a cNMF instance."""
+    if engine not in ("cpu", "gpu"):
+        raise ValueError("engine must be 'cpu' or 'gpu'")
+    if engine == "cpu":
+        return cnmf_obj
+
+    def _gpu_nmf(X, nmf_kwargs):
+        nmf_kwargs = dict(nmf_kwargs)
+        nmf_kwargs["engine"] = "gpu"
+        nmf_kwargs["gpu"] = gpu_kwargs or {}
+        return nmf_gpu(cnmf_obj, X, nmf_kwargs)
+
+    cnmf_obj._nmf = _gpu_nmf
+
+    # Factorize packs same-k replicates according to gpu_kwargs["batch"].
+    cnmf_obj.factorize = functools.partial(factorize_gpu, cnmf_obj, gpu_kwargs or {})
+    return cnmf_obj
+
+
+def nmf_gpu(self, X, nmf_kwargs):
+    """cNMF `_nmf` adapter; `self` is ignored for monkeypatch compatibility."""
     nmf_kwargs = dict(nmf_kwargs)
     gpu_kwargs = nmf_kwargs.pop("gpu", None)
     nmf_kwargs.pop("engine", None)
-    return factorize_nmf_gpu(X, nmf_kwargs, gpu_kwargs)
+    return _nmf_gpu(X, nmf_kwargs, gpu_kwargs)
+
+
+def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_completed_runs=False):
+    """GPU `factorize` drop-in: group worker jobs by k, batch seeds, write iter spectra."""
+    import scanpy as sc
+    import yaml
+    import pandas as pd
+    from collections import OrderedDict
+    from .cnmf import load_df_from_npz, save_df_to_npz, worker_filter
+
+    batch = _resolve_gpu_opts(gpu_kwargs)["batch"]
+
+    run_params  = load_df_from_npz(cnmf_obj.paths['nmf_replicate_parameters'])
+    norm_counts = sc.read(cnmf_obj.paths['normalized_counts'])
+    base_kwargs = yaml.load(open(cnmf_obj.paths['nmf_run_parameters']), Loader=yaml.FullLoader)
+
+    if not skip_completed_runs:
+        job_idx = worker_filter(range(len(run_params)), worker_i, total_workers)
+    else:
+        job_idx = worker_filter(run_params.index[run_params['completed'] == False], worker_i, total_workers)
+
+    genes = norm_counts.var.index
+    by_k = OrderedDict()
+    for idx in job_idx:
+        p = run_params.iloc[idx, :]
+        by_k.setdefault(int(p['n_components']), []).append((int(p['iter']), int(p['nmf_seed'])))
+
+    for k, jobs in by_k.items():
+        run_kwargs = dict(base_kwargs); run_kwargs['n_components'] = k
+        for start in range(0, len(jobs), batch):
+            chunk = jobs[start:start + batch]
+            iters = [it for it, _ in chunk]
+            seeds = [s for _, s in chunk]
+            print('[Worker %d]. k=%d: launching %d replicate(s), iters=%s.'
+                  % (worker_i, k, len(chunk), iters))
+            results = _nmf_gpu_mu(norm_counts.X, seeds, run_kwargs, gpu_kwargs)
+            for (spectra, _usages), it in zip(results, iters):
+                spectra = pd.DataFrame(spectra, index=np.arange(1, k + 1), columns=genes)
+                save_df_to_npz(spectra, cnmf_obj.paths['iter_spectra'] % (k, it))

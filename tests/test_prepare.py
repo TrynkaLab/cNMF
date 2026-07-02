@@ -5,6 +5,7 @@ import scanpy as sc
 import os
 import scipy.sparse as sp
 from cnmf import cNMF, save_df_to_npz, load_df_from_npz
+from cnmf import nmf_gpu
 
 # Global parameters for data simulation
 NUM_CELLS = 100
@@ -58,7 +59,105 @@ def generate_counts_file(tmp_path, file_format, dtype=np.int64, zero_count=False
 
     return str(counts_fn)
 
+@pytest.mark.parametrize("file_format", ["txt", "npz", "h5ad"])
+@pytest.mark.parametrize("dtype", [np.int64, np.float32, np.float64])
+@pytest.mark.parametrize("densify", [True, False])
+def test_prepare(mock_cnmf, file_format, dtype, densify, tmp_path):
+    counts_fn = generate_counts_file(tmp_path, file_format, dtype)
+    
+    output_dir = tmp_path / "output"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    mock_cnmf.prepare(counts_fn, components=[5, 10], n_iter=10, densify=densify)
+    
+    # Check if output files were created
+    expected_files = [
+        mock_cnmf.paths['normalized_counts'],
+        mock_cnmf.paths['nmf_replicate_parameters'],
+        mock_cnmf.paths['nmf_run_parameters'],
+        mock_cnmf.paths['nmf_genes_list'],
+        mock_cnmf.paths['tpm'],
+        mock_cnmf.paths['tpm_stats']
+    ]
+    
+    for file in expected_files:
+        assert os.path.exists(file), f"Expected output file {file} not found."
+    
+    # Clean up after test
+    for file in expected_files:
+        os.remove(file)
 
+@pytest.mark.parametrize("file_format", ["txt", "npz", "h5ad"])
+@pytest.mark.parametrize("dtype", [np.int64, np.float32, np.float64])
+@pytest.mark.parametrize("densify", [True, False])
+def test_prepare_raises_on_zero_count_cells(mock_cnmf, file_format, dtype, densify, tmp_path):
+    counts_fn = generate_counts_file(tmp_path, file_format, dtype, zero_count=True)
+
+    with pytest.raises(Exception, match="Error: .* cells have zero counts of overdispersed genes.*"):
+        mock_cnmf.prepare(counts_fn, components=[5, 10], n_iter=10, densify=densify)
+
+
+def test_configure_nmf_engine_gpu_factorize_groups_by_k_and_writes_each_replicate(mock_cnmf, monkeypatch, tmp_path):
+    """GPU factorize groups by k, batches seeds, and writes one spectra file per replicate."""
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    mock_cnmf.prepare(counts_fn, components=[5, 7], n_iter=3, densify=True)
+
+    calls = []
+
+    def fake_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+        k = int(nmf_kwargs["n_components"])
+        calls.append((k, [int(s) for s in seeds]))
+        return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
+
+    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_mu", fake_mu)
+
+    nmf_gpu.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "batch": 2})
+    mock_cnmf.factorize(worker_i=0, total_workers=1)
+
+    # Two k-values x three replicates, chunked by batch=2 -> four launches.
+    assert len(calls) == 4
+    assert sorted(len(seeds) for _, seeds in calls) == [1, 1, 2, 2]
+    for k, seeds in calls:
+        assert k in (5, 7)
+        assert 1 <= len(seeds) <= 2
+
+    run_params = load_df_from_npz(mock_cnmf.paths["nmf_replicate_parameters"])
+    for _, row in run_params.iterrows():
+        path = mock_cnmf.paths["iter_spectra"] % (int(row["n_components"]), int(row["iter"]))
+        assert os.path.exists(path), f"missing iter_spectra for k={row['n_components']} iter={row['iter']}"
+
+    handed = sorted(s for _, seeds in calls for s in seeds)
+    assert handed == sorted(int(s) for s in run_params["nmf_seed"])
+
+
+def test_configure_nmf_engine_installs_gpu_factorize_at_default_batch_1(mock_cnmf, monkeypatch, tmp_path):
+    """Default GPU factorize uses batch=1: one seed per `_nmf_gpu_mu` launch."""
+    counts_fn = generate_counts_file(tmp_path, "npz", np.float64)
+    mock_cnmf.prepare(counts_fn, components=[6], n_iter=2, densify=True)
+
+    calls = []
+
+    def fake_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+        calls.append([int(s) for s in seeds])
+        k = int(nmf_kwargs["n_components"])
+        return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
+
+    monkeypatch.setattr(nmf_gpu, "_nmf_gpu_mu", fake_mu)
+
+    nmf_gpu.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu"})
+    mock_cnmf.factorize(worker_i=0, total_workers=1)
+
+    assert len(calls) == 2
+    assert all(len(seeds) == 1 for seeds in calls)
+    run_params = load_df_from_npz(mock_cnmf.paths["nmf_replicate_parameters"])
+    for _, row in run_params.iterrows():
+        path = mock_cnmf.paths["iter_spectra"] % (int(row["n_components"]), int(row["iter"]))
+        assert os.path.exists(path), f"missing iter_spectra for k={row['n_components']} iter={row['iter']}"
+
+
+# ---------------------------------------------------------------------
+# cNMF <-> GPU engine integration: factorize / refit / consensus routing
+# ---------------------------------------------------------------------
 def generate_positive_counts_file(tmp_path, cells=24, genes=12, dtype=np.float64):
     """Generate a small dense positive count table for consensus smoke tests."""
     rng = np.random.default_rng(SEED)
@@ -99,9 +198,6 @@ def fake_gpu_nmf_output(X, nmf_kwargs):
     return fixed_h.copy(), usages
 
 
-# ---------------------------------------------------------------------
-# GPU factorize wiring integration
-# ---------------------------------------------------------------------
 def test_get_nmf_iter_params_default_cpu_engine_does_not_change_sklearn_kwargs(mock_cnmf):
     """Default CPU runs should not add engine/gpu keys to sklearn NMF kwargs."""
     _replicate_params, run_params = mock_cnmf.get_nmf_iter_params(ks=[5, 7], n_iter=3, random_state_seed=14)
@@ -114,7 +210,8 @@ def test_get_nmf_iter_params_default_cpu_engine_does_not_change_sklearn_kwargs(m
 
 
 def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):
-    """cNMF factorize should pass n_components, random_state, run params, and GPU kwargs to `_nmf_gpu`."""
+    """factorize_gpu should hand each replicate's seed, n_components, forwarded run params, and the
+    resolved GPU kwargs to the batch kernel _nmf_gpu_mu (default batch=1 -> one seed per launch)."""
     import cnmf.nmf_gpu as gpu_mod
 
     counts_fn = generate_counts_file(tmp_path, "txt", np.int64)
@@ -122,35 +219,32 @@ def test_factorize_gpu_engine_passes_seed_components_run_params_and_gpu_kwargs(m
 
     captured = []
 
-    def fake_nmf_gpu(self, X, nmf_kwargs):
-        captured.append(dict(nmf_kwargs))
-        k = nmf_kwargs["n_components"]
-        return np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))    # (spectra, usages)
+    def fake_mu(X, seeds, nmf_kwargs, gpu_kwargs=None):
+        captured.append((list(seeds), dict(nmf_kwargs), gpu_kwargs))
+        k = int(nmf_kwargs["n_components"])
+        return [(np.zeros((k, X.shape[1])), np.zeros((X.shape[0], k))) for _ in seeds]
 
-    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    monkeypatch.setattr(gpu_mod, "_nmf_gpu_mu", fake_mu)
     gpu_kwargs = {"device": "cpu", "dtype": "fp64"}
     gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs=gpu_kwargs)
 
     mock_cnmf.factorize(worker_i=0, total_workers=1)
 
-    assert len(captured) == 2                       # n_iter=2 replicates for k=5
+    assert len(captured) == 2                          # n_iter=2 replicates, batch=1 -> 2 launches
     replicate_params = load_df_from_npz(mock_cnmf.paths["nmf_replicate_parameters"])
     expected_seeds = set(replicate_params["nmf_seed"])
     observed_seeds = set()
-    for kw in captured:
-        assert kw["n_components"] == 5              # set per replicate by factorize
-        assert kw["engine"] == "gpu"               # adapter embedded the engine
-        assert kw["gpu"] == gpu_kwargs             # ...and the resolved GPU kwargs
-        assert "beta_loss" in kw and "init" in kw  # original run params forwarded
-        observed_seeds.add(kw["random_state"])
-    assert observed_seeds == expected_seeds          # exact seeds from prepared replicate params
+    for seeds, kw, gk in captured:
+        assert len(seeds) == 1                         # default batch=1 -> one seed per launch
+        assert kw["n_components"] == 5                 # set per k by factorize
+        assert "beta_loss" in kw and "init" in kw      # original run params forwarded
+        assert gk == gpu_kwargs                        # resolved GPU kwargs passed through
+        observed_seeds.update(seeds)
+    assert observed_seeds == expected_seeds            # exact seeds from prepared replicate params
     for iter_i in replicate_params["iter"]:
         assert os.path.exists(mock_cnmf.paths["iter_spectra"] % (5, iter_i))
 
 
-# ---------------------------------------------------------------------
-# GPU consensus/refit wiring
-# ---------------------------------------------------------------------
 def test_refit_usage_gpu_engine_passes_fixed_h_update_h_false_and_gpu_kwargs(mock_cnmf, monkeypatch, tmp_path):
     """cNMF refit_usage should route fixed-H consensus refits through the GPU adapter."""
     import cnmf.nmf_gpu as gpu_mod
@@ -172,7 +266,7 @@ def test_refit_usage_gpu_engine_passes_fixed_h_update_h_false_and_gpu_kwargs(moc
         captured.append((X_arg, dict(nmf_kwargs)))
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
     gpu_kwargs = {"device": "cpu", "dtype": "fp64"}
     gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs=gpu_kwargs)
 
@@ -213,7 +307,7 @@ def test_refit_spectra_gpu_engine_routes_through_transposed_refit_usage(mock_cnm
         captured.append((X_arg, dict(nmf_kwargs)))
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
     gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "dtype": "fp64"})
 
     spectra = mock_cnmf.refit_spectra(X, usage)
@@ -258,7 +352,7 @@ def test_consensus_gpu_engine_smoke_writes_expected_outputs(mock_cnmf, monkeypat
     def fake_nmf_gpu(self, X_arg, nmf_kwargs):
         return fake_gpu_nmf_output(X_arg, nmf_kwargs)
 
-    monkeypatch.setattr(gpu_mod, "_nmf_gpu", fake_nmf_gpu)
+    monkeypatch.setattr(gpu_mod, "nmf_gpu", fake_nmf_gpu)
     gpu_mod.configure_nmf_engine(mock_cnmf, engine="gpu", gpu_kwargs={"device": "cpu", "dtype": "fp64"})
 
     mock_cnmf.consensus(k=2, density_threshold=2.0, local_neighborhood_size=0.5,
@@ -309,41 +403,3 @@ def test_consensus_default_cpu_engine_keeps_original_sklearn_nmf_path(mock_cnmf,
     assert kw["update_H"] is False
     assert np.allclose(kw["H"], spectra.values)
     assert usages.shape == (4, 2)
-
-
-@pytest.mark.parametrize("file_format", ["txt", "npz", "h5ad"])
-@pytest.mark.parametrize("dtype", [np.int64, np.float32, np.float64])
-@pytest.mark.parametrize("densify", [True, False])
-def test_prepare(mock_cnmf, file_format, dtype, densify, tmp_path):
-    counts_fn = generate_counts_file(tmp_path, file_format, dtype)
-    
-    output_dir = tmp_path / "output"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    mock_cnmf.prepare(counts_fn, components=[5, 10], n_iter=10, densify=densify)
-    
-    # Check if output files were created
-    expected_files = [
-        mock_cnmf.paths['normalized_counts'],
-        mock_cnmf.paths['nmf_replicate_parameters'],
-        mock_cnmf.paths['nmf_run_parameters'],
-        mock_cnmf.paths['nmf_genes_list'],
-        mock_cnmf.paths['tpm'],
-        mock_cnmf.paths['tpm_stats']
-    ]
-    
-    for file in expected_files:
-        assert os.path.exists(file), f"Expected output file {file} not found."
-    
-    # Clean up after test
-    for file in expected_files:
-        os.remove(file)
-
-@pytest.mark.parametrize("file_format", ["txt", "npz", "h5ad"])
-@pytest.mark.parametrize("dtype", [np.int64, np.float32, np.float64])
-@pytest.mark.parametrize("densify", [True, False])
-def test_prepare_raises_on_zero_count_cells(mock_cnmf, file_format, dtype, densify, tmp_path):
-    counts_fn = generate_counts_file(tmp_path, file_format, dtype, zero_count=True)
-
-    with pytest.raises(Exception, match="Error: .* cells have zero counts of overdispersed genes.*"):
-        mock_cnmf.prepare(counts_fn, components=[5, 10], n_iter=10, densify=densify)
