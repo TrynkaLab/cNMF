@@ -570,23 +570,66 @@ def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
     }
 
 
-def test_validate_engine_args_for_command_rejects_non_factorize_gpu_options(kernel):
-    """Engine/GPU options should be accepted only for commands that support GPU factorization."""
+def test_validate_engine_args_for_command_rejects_non_engine_command_gpu_options(kernel):
+    """Engine/GPU options should be accepted only for factorize and consensus."""
     parser = argparse.ArgumentParser()
     parser.add_argument("command")
     kernel.parse_gpu_args(parser)
-    supported = ("factorize",)
+    supported = ("factorize", "consensus")
 
-    # factorize accepts engine/GPU options (no raise)
-    kernel.validate_engine_args_for_command(parser.parse_args(["factorize", "--engine", "gpu"]), supported)
+    # factorize and consensus accept engine/GPU options (no raise)
+    for argv in (
+        ["factorize", "--engine", "gpu"],
+        ["consensus", "--engine", "gpu"],
+        ["consensus", "--gpu-device", "cuda"],
+    ):
+        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
 
-    # a non-factorize command carrying engine/GPU options is rejected
-    for argv in (["prepare", "--engine", "gpu"], ["consensus", "--gpu-device", "cuda"]):
+    # non-engine commands carrying engine/GPU options are rejected
+    for argv in (
+        ["prepare", "--engine", "gpu"],
+        ["combine", "--gpu-device", "cuda"],
+        ["k_selection_plot", "--gpu-dtype", "fp32"],
+    ):
         with pytest.raises(ValueError, match="only valid with"):
             kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
 
-    # a non-factorize command without engine/GPU options is fine
+    # non-engine commands without engine/GPU options are fine
     kernel.validate_engine_args_for_command(parser.parse_args(["prepare"]), supported)
+
+
+# ---------------------------------------------------------------------
+# GPU CLI and cNMF consensus wiring
+# ---------------------------------------------------------------------
+def test_validate_engine_args_accepts_consensus_gpu_options(kernel):
+    """`consensus --engine gpu` and consensus GPU flags should be valid CLI input."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize", "consensus")
+
+    for argv in (
+        ["consensus", "--engine", "gpu"],
+        ["consensus", "--engine", "gpu", "--gpu-device", "CUDA:0", "--gpu-dtype", "FP32"],
+        ["consensus", "--gpu-allow-tf32", "--gpu-compile"],
+    ):
+        kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
+
+
+def test_validate_engine_args_rejects_gpu_options_for_non_engine_commands(kernel):
+    """GPU flags should still be rejected for prepare/combine/k_selection_plot."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command")
+    kernel.parse_gpu_args(parser)
+    supported = ("factorize", "consensus")
+
+    for argv in (
+        ["prepare", "--engine", "gpu"],
+        ["combine", "--gpu-device", "cuda"],
+        ["k_selection_plot", "--gpu-check-every", "2"],
+    ):
+        with pytest.raises(ValueError, match="only valid with"):
+            kernel.validate_engine_args_for_command(parser.parse_args(argv), supported)
 
 
 def test_configure_nmf_engine_cpu_leaves_cnmf_instance_unchanged(kernel):
@@ -784,6 +827,98 @@ def test_nndsvd_nndsvda_nndsvdar_initializers_return_valid_outputs(kernel):
             {"device": "cpu"},
         )
         assert_valid_nmf_output(X, H, W, 3)
+
+
+# ---------------------------------------------------------------------
+# Consensus fixed-H kernel behavior
+# ---------------------------------------------------------------------
+def test_factorize_nmf_gpu_update_h_false_keeps_fixed_h_and_updates_only_w(kernel):
+    """Consensus refit should preserve supplied H and optimize usages W only."""
+    require_nmf_runtime()
+    fixed_h = np.array([[1.0, 0.3, 0.6], [0.2, 1.1, 0.4]], dtype=np.float64)
+    true_w = np.array([[1.0, 0.5], [0.4, 1.2], [1.5, 0.3], [0.7, 0.9]], dtype=np.float64)
+    X = true_w @ fixed_h
+
+    H, W = kernel.factorize_nmf_gpu(
+        X,
+        {"n_components": 2, "max_iter": 5, "random_state": 0, "update_H": False, "H": fixed_h},
+        {"device": "cpu", "dtype": "fp64", "check_every": 5},
+    )
+
+    assert_valid_nmf_output(X, H, W, 2)
+    assert np.allclose(H, fixed_h)
+
+
+def test_to_checked_fixed_h_rejects_missing_invalid_or_incompatible_h(kernel):
+    """Fixed-H consensus refit should fail clearly for invalid supplied spectra."""
+    with pytest.raises(ValueError, match="requires a fixed H"):
+        kernel._to_checked_fixed_h(None, 2, 3)
+
+    invalid_cases = [
+        (np.array([1.0, 2.0, 3.0]), "2D"),
+        (np.ones((3, 3)), "shape"),
+        (np.array([[1.0, np.nan, 0.2], [0.4, 0.5, 0.6]]), "NaN/inf"),
+        (np.array([[1.0, -0.1, 0.2], [0.4, 0.5, 0.6]]), "non-negative"),
+    ]
+    for H, message in invalid_cases:
+        with pytest.raises(ValueError, match=message):
+            kernel._to_checked_fixed_h(H, 2, 3)
+
+
+def test_mu_step_fixed_h_matches_manual_w_only_update(kernel):
+    """One fixed-H MU step should match the manual W-only Frobenius update."""
+    torch = require_nmf_runtime()
+    Xg = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float64)
+    W0 = torch.tensor([[0.5, 0.7], [0.9, 1.1]], dtype=torch.float64)
+    H = torch.tensor([[0.6, 0.8], [1.0, 1.2]], dtype=torch.float64)
+    eps = torch.tensor(1e-9, dtype=torch.float64)
+    H_before = H.clone()
+
+    expected_W = W0 * ((Xg @ H.T) / (W0 @ (H @ H.T) + eps))
+    W = kernel._mu_step_fixed_h(W0, H, Xg, eps)
+
+    assert torch.allclose(W, expected_W)
+    assert torch.allclose(H, H_before)
+
+
+def test_fit_mu_fixed_h_respects_early_stop_and_max_iter_block_bounds(kernel):
+    """Fixed-H fit loop should share early-stop and no-overrun guarantees with full MU."""
+    torch = require_nmf_runtime()
+    Xg = torch.full((3, 2), 2.0, dtype=torch.float64)
+    W = torch.ones((3, 1), dtype=torch.float64)
+    H = torch.ones((1, 2), dtype=torch.float64)
+    eps = torch.tensor(1e-9, dtype=torch.float64)
+
+    early_calls = {"count": 0}
+
+    def no_change_step_early(W, H, Xg, eps):
+        early_calls["count"] += 1
+        return W
+
+    kernel._fit_mu_fixed_h(torch, Xg, W, H, eps, 10, 1e-4, no_change_step_early, 1, False, "cpu")
+    assert early_calls["count"] == 2
+
+    max_iter_calls = {"count": 0}
+
+    def no_change_step_max_iter(W, H, Xg, eps):
+        max_iter_calls["count"] += 1
+        return W
+
+    kernel._fit_mu_fixed_h(torch, Xg, W, H, eps, 6, -1.0, no_change_step_max_iter, 4, False, "cpu")
+    assert max_iter_calls["count"] == 6
+
+
+def test_execution_plan_for_fixed_h_compile_uses_fixed_h_step_and_compile_block(kernel):
+    """Compiled consensus refit should compile _mu_step_fixed_h and use compile_block."""
+    calls = []
+    fake_torch = SimpleNamespace(compile=lambda fn: calls.append(fn) or fn)
+    opt = dict(kernel.DEFAULT_GPU, compile=True, check_every=1, compile_block=3)
+
+    step, block = kernel._execution_plan(fake_torch, opt, "cpu", kernel._mu_step_fixed_h)
+
+    assert calls == [kernel._mu_step_fixed_h]
+    assert step is kernel._mu_step_fixed_h
+    assert block == 3
 
 
 # ---------------------------------------------------------------------
