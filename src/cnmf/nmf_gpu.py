@@ -576,6 +576,10 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
         job_idx = worker_filter(run_params.index[run_params['completed'] == False], worker_i, total_workers)
 
     genes = norm_counts.var.index
+    # Densify X once. _nmf_gpu_mu -> _gpu_setup calls X.toarray(), so passing the sparse matrix
+    # would re-densify the full n×g matrix on *every* batch (O(#batches) redundant conversions plus
+    # RAM churn at millions of cells). Convert once here; downstream then sees a dense ndarray.
+    X_dense = norm_counts.X.toarray() if hasattr(norm_counts.X, "toarray") else np.asarray(norm_counts.X)
     by_k = OrderedDict()
     for idx in job_idx:
         p = run_params.iloc[idx, :]
@@ -589,7 +593,7 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
             seeds = [s for _, s in chunk]
             print('[Worker %d]. k=%d: launching %d replicate(s), iters=%s.'
                   % (worker_i, k, len(chunk), iters))
-            results = _nmf_gpu_mu(norm_counts.X, seeds, run_kwargs, gpu_kwargs)
+            results = _nmf_gpu_mu(X_dense, seeds, run_kwargs, gpu_kwargs)
             for (spectra, _usages), it in zip(results, iters):
                 spectra = pd.DataFrame(spectra, index=np.arange(1, k + 1), columns=genes)
                 save_df_to_npz(spectra, cnmf_obj.paths['iter_spectra'] % (k, it))
