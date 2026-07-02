@@ -338,10 +338,23 @@ def _recon_err(Xg, W, H, xnorm2):
     return (xnorm2 - 2.0 * cross + whnorm).clamp_min(0).sqrt()
 
 
+def _sq_norm(X):
+    """‖X‖² (every element squared, then summed) in row chunks. torch.dot is BLAS-backed and caps
+    its vector length at 2³¹ elements, so a flat dot overflows past ~2.1B entries (e.g. 2.4M cells
+    × 2000 genes = 4.8B); this chunked reduction is index-safe at any size and also bounds the
+    squaring temporary. Returns a 0-dim tensor."""
+    rows = X.shape[0]
+    step = max(1, (1 << 28) // max(1, X.numel() // max(1, rows)))      # ~2²⁸ elems/chunk (~1GB fp32)
+    total = X.new_zeros(())
+    for i in range(0, rows, step):
+        total = total + X[i:i + step].square().sum()
+    return total
+
+
 def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run full MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    xnorm2 = torch.dot(Xg.reshape(-1), Xg.reshape(-1))     # ‖X‖² once; error check avoids [R,n,g]
+    xnorm2 = _sq_norm(Xg)                                  # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -362,7 +375,7 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
 def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run fixed-H MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    xnorm2 = torch.dot(Xg.reshape(-1), Xg.reshape(-1))     # ‖X‖² once; error check avoids [R,n,g]
+    xnorm2 = _sq_norm(Xg)                                  # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
