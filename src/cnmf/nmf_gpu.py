@@ -327,10 +327,34 @@ def _mu_step_fixed_h(W, H, Xg, eps):
 # ---------------------------------------------------------------------
 
 
+def _recon_err(Xg, W, H, xnorm2):
+    """Per-replicate ‖X − WH‖_F via the identity ‖X‖² − 2⟨X,WH⟩ + ‖WH‖², using only small
+    [R,k,g]/[R,k,k] matmuls (WᵀX, WᵀW, HHᵀ) — it NEVER materializes the [R,n,g] product, so batched
+    fits scale to millions of cells (a full [R,n,g] residual would be ~R·n·g floats, tens of GB).
+    Returns a 0-dim tensor (unbatched) or shape-[R] (batched); xnorm2 = ‖X‖² is precomputed once."""
+    Wt = W.transpose(-2, -1)
+    cross = ((Wt @ Xg) * H).sum(dim=(-2, -1))                          # ⟨X, WH⟩ per replicate
+    whnorm = ((Wt @ W) * (H @ H.transpose(-2, -1))).sum(dim=(-2, -1))  # ‖WH‖² per replicate
+    return (xnorm2 - 2.0 * cross + whnorm).clamp_min(0).sqrt()
+
+
+def _sq_norm(X):
+    """‖X‖² (every element squared, then summed) in row chunks. torch.dot is BLAS-backed and caps
+    its vector length at 2³¹ elements, so a flat dot overflows past ~2.1B entries (e.g. 2.4M cells
+    × 2000 genes = 4.8B); this chunked reduction is index-safe at any size and also bounds the
+    squaring temporary. Returns a 0-dim tensor."""
+    rows = X.shape[0]
+    step = max(1, (1 << 28) // max(1, X.numel() // max(1, rows)))      # ~2²⁸ elems/chunk (~1GB fp32)
+    total = X.new_zeros(())
+    for i in range(0, rows, step):
+        total = total + X[i:i + step].square().sum()
+    return total
+
+
 def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run full MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
+    xnorm2 = _sq_norm(Xg)                                  # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -339,7 +363,7 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
             for _ in range(n):                             # MU updates run inside the (compiled) step
                 W, H = step(W, H, Xg, eps)
             it += n
-            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
+            err = _recon_err(Xg, W, H, xnorm2)
             if err_init is None:
                 err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
             elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
@@ -351,7 +375,7 @@ def _fit_mu(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
 def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, device):
     """Run fixed-H MU until `max_iter` or all replicate slices meet `tol`."""
     _check_runtime_tensors(Xg, W, H, eps)
-    lead = W.shape[:-2]                                     # () unbatched, (R,) batched
+    xnorm2 = _sq_norm(Xg)                                  # ‖X‖² once; error check avoids [R,n,g]
     err_init = prev_err = None
     with torch.no_grad(), _cuda_tf32(torch, tf32, device):
         it = 0
@@ -360,7 +384,7 @@ def _fit_mu_fixed_h(torch, Xg, W, H, eps, max_iter, tol, step, block, tf32, devi
             for _ in range(n):
                 W = step(W, H, Xg, eps)
             it += n
-            err = torch.linalg.norm((Xg - W @ H).reshape(*lead, -1), dim=-1)
+            err = _recon_err(Xg, W, H, xnorm2)
             if err_init is None:
                 err_init = err.clamp_min(1e-30)            # avoid 0/0 on a degenerate (all-zero) slice
             elif prev_err is not None and bool((((prev_err - err) / err_init) < tol).all()):
@@ -552,6 +576,10 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
         job_idx = worker_filter(run_params.index[run_params['completed'] == False], worker_i, total_workers)
 
     genes = norm_counts.var.index
+    # Densify X once. _nmf_gpu_mu -> _gpu_setup calls X.toarray(), so passing the sparse matrix
+    # would re-densify the full n×g matrix on *every* batch (O(#batches) redundant conversions plus
+    # RAM churn at millions of cells). Convert once here; downstream then sees a dense ndarray.
+    X_dense = norm_counts.X.toarray() if hasattr(norm_counts.X, "toarray") else np.asarray(norm_counts.X)
     by_k = OrderedDict()
     for idx in job_idx:
         p = run_params.iloc[idx, :]
@@ -565,7 +593,7 @@ def factorize_gpu(cnmf_obj, gpu_kwargs, worker_i=0, total_workers=1, skip_comple
             seeds = [s for _, s in chunk]
             print('[Worker %d]. k=%d: launching %d replicate(s), iters=%s.'
                   % (worker_i, k, len(chunk), iters))
-            results = _nmf_gpu_mu(norm_counts.X, seeds, run_kwargs, gpu_kwargs)
+            results = _nmf_gpu_mu(X_dense, seeds, run_kwargs, gpu_kwargs)
             for (spectra, _usages), it in zip(results, iters):
                 spectra = pd.DataFrame(spectra, index=np.arange(1, k + 1), columns=genes)
                 save_df_to_npz(spectra, cnmf_obj.paths['iter_spectra'] % (k, it))
