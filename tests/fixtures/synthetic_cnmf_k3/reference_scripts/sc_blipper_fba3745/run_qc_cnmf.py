@@ -1,22 +1,22 @@
 #!/usr/bin/env python
 
-from itertools import combinations
-
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import scipy.sparse as sp
-import seaborn as sns
-from joblib import Parallel, delayed
-from sklearn.metrics import (
-    calinski_harabasz_score,
-    davies_bouldin_score,
-    pairwise_distances,
-    silhouette_score,
-)
-from sklearn.preprocessing import scale
+import argparse
 from tqdm import tqdm
-
+from sklearn.metrics import pairwise_distances
+from itertools import combinations
+from joblib import Parallel, delayed
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score, calinski_harabasz_score, davies_bouldin_score
+import scanpy as sc
+from cnmf import cNMF
+import yaml
+from sklearn.decomposition import non_negative_factorization
+from sklearn.preprocessing import scale
+import scipy.sparse as sp
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 def pairwise_dist(mat, grouping, dist='sqeuclidean', sample_correct=True, n_jobs=-1, verbose=True):
     """Average of pairwise distances between cells of each group.
@@ -138,7 +138,6 @@ def get_r2(X, U, H, log2p1=False, scale=False):
     
     return r2, sse, tss
 
-
 def plot_heatmap(df, outfile, scale_rows=False):
     # df: rows=sources, cols=conditions
     if scale_rows:
@@ -202,30 +201,56 @@ def nmf_variance_explained(X, U, H):
     return r2_base, sse_base, tss_base, r2_wo, sse_wo, tss_wo
 
 
-def run_qc(
-    output,
-    prefix,
-    k,
-    reorder,
-    median_spectra,
-    l2_spectra,
-    local_density,
-    kmeans_cluster_labels,
-    normalized_counts,
-    refit_usages,
-):
-    """Calculate and save QC using state already produced by ``consensus``."""
-    # local_density contains all spectra, while l2_spectra has already been density-filtered.
-    nruns = len(local_density)
-    nruns_per_gep = nruns/k
-    if sp.issparse(normalized_counts):
-        normalized_counts = np.asarray(normalized_counts.todense())
-    run_r2, run_sse, run_tss = get_r2(
-        normalized_counts,
-        refit_usages,
-        median_spectra.values,
-    )
+if __name__ == "__main__":
+              
+    parser = argparse.ArgumentParser(description="Calculate QC metrics on an NMF run")
+    parser.add_argument('--spectra', required=True, help='path to merged spectra npz')
+    parser.add_argument('--density', required=True, help='path to local density npz')
+    parser.add_argument('--norm_counts', required=True, help='path to norm_counts h5ad')
+    parser.add_argument('--params', required=False, help='path to nmf params yaml (can be skipped if --skip_varexp is set)', default=None)
+    parser.add_argument('--density_threshold', required=True, type=float, help='density threshold (float)')
+    parser.add_argument('--output', required=True, help='output prefix')
+    parser.add_argument('--k', required=True, type=int, help='number of clusters')
+    parser.add_argument('--skip_varexp', dest='skip_varexp', action='store_true', help='Skip calculating variance explained (default: false)')
+    parser.set_defaults(skip_varexp=False)
+    params = parser.parse_args()
 
+    # This script is partially reverse engineered from cNMF
+    # https://github.com/dylkot/cNMF/blob/main/src/cnmf/cnmf.py
+    
+    #---------------------------------------------
+    print("Re-clustering spectra")
+    
+    # Re-construct the clustering cNMF does
+    merged_spectra = load_df_from_npz(params.spectra)
+    
+    # L2 normalize the raw spectra
+    l2_spectra = (merged_spectra.T/np.sqrt((merged_spectra**2).sum(axis=1))).T
+    
+    # Filter for density
+    local_density = load_df_from_npz(params.density)
+    
+    nruns = l2_spectra.shape[0]
+    nruns_per_gep = nruns/params.k
+    
+    density_filter = local_density.iloc[:, 0] < params.density_threshold
+    l2_spectra = l2_spectra.loc[density_filter, :]
+    if l2_spectra.shape[0] == 0:
+        raise RuntimeError("Zero components remain after density filtering. Consider increasing density threshold")
+
+    # Cluster
+    kmeans_model = KMeans(n_clusters=params.k, n_init=10, random_state=1)
+    kmeans_model.fit(l2_spectra)
+    kmeans_cluster_labels = pd.Series(kmeans_model.labels_+1, index=l2_spectra.index)
+    kmeans_cluster_labels = kmeans_cluster_labels
+    
+    # Find median usage for each gene across cluster
+    # Row index is the cluster labels
+    median_spectra = l2_spectra.groupby(kmeans_cluster_labels).median()
+
+    # Normalize median spectra to probability distributions.
+    median_spectra = (median_spectra.T/median_spectra.sum(1)).T
+    
     #-----------------------------------------------------------------------
     # Calculate how many iterations feed into each GEP    
     unique, counts = np.unique(kmeans_cluster_labels, return_counts=True)
@@ -234,7 +259,7 @@ def run_qc(
         'cluster': unique, 
         'iter_count': counts,
         'iter_perc': (counts/nruns_per_gep)*100,
-        'k': k
+        'k': params.k
     }).sort_values('cluster', ascending=True)
 
     #-----------------------------------------------------------------------
@@ -255,9 +280,46 @@ def run_qc(
     annotation['nonzero_perc'] =  (annotation['nonzero_genes'] / median_spectra.shape[1]) *100
    
     #-----------------------------------------------------------------------
+    # This is needed to be able to properly order the GEPs by total usage across all cells,
+    # which is important for consistency with the main cNMF pipeline.
+    # Secondly its also needed to estimate the error metrics.
+    print("Re-fitting NMF with fixed H to get usages")
+    
+    norm_counts = sc.read(params.norm_counts)
+    refit_nmf_kwargs = yaml.load(open(params.params), Loader=yaml.FullLoader)
+    
+    if type(median_spectra) is pd.DataFrame:
+        refit_nmf_kwargs.update(dict(n_components = median_spectra.shape[0], H = median_spectra.values, update_H = False))
+    else:
+        refit_nmf_kwargs.update(dict(n_components = median_spectra.shape[0], H = median_spectra, update_H = False))
+                
+    (usages, _, niter) = non_negative_factorization(norm_counts.X,  **refit_nmf_kwargs)
+    rf_usages = pd.DataFrame(usages, index=norm_counts.obs.index, columns=median_spectra.index)  
+    
+    #-----------------------------------------------------------------------
     # Re-order based on normalized usages, this is important to keep consistency 
     # with the main cNMF pipeline where GEPs are ordered by total usage across all cells.
-    annotation['total_usage'] = annotation['cluster'].map(reorder)
+    norm_usages = rf_usages.div(rf_usages.sum(axis=1), axis=0)    
+    annotation['total_usage'] = norm_usages.values.sum(axis=0)
+    reorder = norm_usages.sum(axis=0).sort_values(ascending=False)
+
+    #-----------------------------------------------------------------------
+    # Calculate the LOO variance explained     
+    # Read the 'counts' data that the nmf was fit on
+    if not params.skip_varexp:
+        
+        print("Estimating variance explained per program by leaving one out")
+        # Baseline r2
+        print(type(norm_counts.X))
+        r2_base, sse_base, tss_base, r2_wo, sse_wo, tss_wo = nmf_variance_explained(norm_counts.X, rf_usages.values, median_spectra.values)
+    
+        annotation['r2_diff'] = r2_base - np.array(r2_wo)
+        annotation['loo_r2'] = r2_wo
+        annotation['loo_sse'] = sse_wo
+        annotation['loo_tss'] = tss_wo
+        annotation['run_r2'] = r2_base
+        annotation['run_sse'] = sse_base
+        annotation['run_tss'] = tss_base
  
     #-----------------------------------------------------------------------
     # Calculate clustering metrics, this is a sanity check to see if the clusters are well separated in the spectra space overall
@@ -268,9 +330,6 @@ def run_qc(
     annotation['run_davies_bouldin'] = davies_bouldin_score(l2_spectra.values, kmeans_cluster_labels)
     annotation['run_median_density'] = np.median(local_density.iloc[:, 0])
     annotation['run_mean_density'] = np.mean(local_density.iloc[:, 0])
-    annotation['run_r2'] = run_r2
-    annotation['run_sse'] = run_sse
-    annotation['run_tss'] = run_tss
 
     annotation.index = range(1, len(annotation)+1)
     annotation = annotation.loc[reorder.index,:]
@@ -283,7 +342,8 @@ def run_qc(
     spectra_edist.columns = range(1, len(annotation)+1)
 
     # Save the results
-    annotation.to_csv(f"{output}.{prefix}.annotation.tsv", sep="\t", index=False)
-    spectra_edist.to_csv(f"{output}.{prefix}.edist.tsv", sep="\t", index=True)
+    prefix = f"k_{params.k}.dt_{params.density_threshold}".replace(".", "_")
+    annotation.to_csv(f"{params.output}.{prefix}.annotation.tsv", sep="\t", index=False)
+    spectra_edist.to_csv(f"{params.output}.{prefix}.edist.tsv", sep="\t", index=True)
     
-    plot_heatmap(spectra_edist, f"{output}.{prefix}.edist.pdf", scale_rows=False)
+    plot_heatmap(spectra_edist, f"{params.output}.{prefix}.edist.pdf", scale_rows=False)
