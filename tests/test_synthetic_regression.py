@@ -163,9 +163,11 @@ def test_prepare_matches_dylkot_reference(generated_fixture, tmp_path):
     assert actual_parameters == expected_parameters
 
 
+@pytest.mark.parametrize("row_tiling_ratio", [None, 0.5, 1 / 3], ids=["untiled", "half", "third"])
 def test_gpu_cd_factorize_matches_dylkot_cpu_reference(
     generated_fixture,
     tmp_path,
+    row_tiling_ratio,
 ):
     """GPU-engine FP64 CD on CPU must reproduce canonical CPU-CD spectra."""
     pytest.importorskip("torch")
@@ -186,6 +188,7 @@ def test_gpu_cd_factorize_matches_dylkot_cpu_reference(
         gpu_check_every=1,
         gpu_compile_block=None,
         gpu_batch=N_REPLICATES,
+        gpu_row_tiling_ratio=row_tiling_ratio,
     )
     actual = configure_nmf_engine(cNMF, args)
     expected = _reference_cnmf(generated_fixture.reference_root, "factorize")
