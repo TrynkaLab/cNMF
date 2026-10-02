@@ -41,6 +41,7 @@ def configure_gpu(cnmf_obj, *, command="factorize", solver="mu",
         gpu_check_every=gpu_kwargs.get("check_every"),
         gpu_compile_block=gpu_kwargs.get("compile_block"),
         gpu_batch=gpu_kwargs.get("batch"),
+        gpu_row_tiling_ratio=gpu_kwargs.get("row_tiling_ratio"),
     )
     configured = gpunmf.configure_nmf_engine(
         lambda output_dir, name: cnmf_obj,

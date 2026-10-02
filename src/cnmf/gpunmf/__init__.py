@@ -9,7 +9,7 @@ from collections import OrderedDict
 
 import numpy as np
 
-from . import solver_cd, solver_mu, utils
+from . import solver_cd, solver_mu, tiling, utils
 
 
 __all__ = [
@@ -18,6 +18,7 @@ __all__ = [
     "prepare_gpu",
     "solver_cd",
     "solver_mu",
+    "tiling",
     "utils",
 ]
 

@@ -49,7 +49,8 @@ sklearn MU parity
 sklearn CD parity
     Pins sklearn's serial W-then-H Fast-HALS updates, regularization scaling,
     shuffled coordinate stream, fixed-H zero initialization, and per-replicate
-    projected-gradient stopping for fp64 and fp32 batches.
+    projected-gradient stopping for fp64 and fp32 batches. Tiling must preserve
+    W/H bits and stopping across storage windows; sklearn parity uses tolerances.
 """
 
 import builtins
@@ -924,15 +925,18 @@ def test_sklearn_cd_matches_batched_cuda_when_available(
     "dtype_name,np_dtype",
     [("fp32", np.float32), ("fp64", np.float64)],
 )
+@pytest.mark.parametrize("row_tiling_ratio", [None, 0.5, 1 / 3])
+@pytest.mark.parametrize("update_h", [False, True], ids=["fixed-h", "factorize"])
 def test_cd_cuda_results_are_invariant_to_batch_width(
-    kernel, dtype_name, np_dtype
+    kernel, dtype_name, np_dtype, row_tiling_ratio, update_h
 ):
     """Changing the replicate batch width must not change a CD trajectory."""
     torch = require_nmf_runtime()
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
 
-    X = np.random.default_rng(117).random((41, 23), dtype=np_dtype)
+    rng = np.random.default_rng(117)
+    X = rng.random((2065, 23), dtype=np_dtype)
     X += np_dtype(0.1)
     seeds = [3, 37, 83]
     nmf_kwargs = _cd_nmf_kwargs(
@@ -943,12 +947,16 @@ def test_cd_cuda_results_are_invariant_to_batch_width(
         alpha_W=0.0,
         alpha_H=0.0,
         l1_ratio=0.0,
+        update_H=update_h,
     )
+    if not update_h:
+        nmf_kwargs["H"] = rng.random((5, 23), dtype=np_dtype) + np_dtype(0.1)
     gpu_kwargs = {
         "device": "cuda",
         "dtype": dtype_name,
         "allow_tf32": False,
         "compile": False,
+        "row_tiling_ratio": row_tiling_ratio,
     }
 
     batched = kernel.solver_cd._nmf_gpu_cd(X, seeds, nmf_kwargs, gpu_kwargs)
@@ -956,8 +964,140 @@ def test_cd_cuda_results_are_invariant_to_batch_width(
         (single_H, single_W), = kernel.solver_cd._nmf_gpu_cd(
             X, [seed], nmf_kwargs, gpu_kwargs
         )
-        np.testing.assert_array_equal(batched_H, single_H)
-        np.testing.assert_array_equal(batched_W, single_W)
+        np.testing.assert_array_equal(batched_H.view(np.uint64), single_H.view(np.uint64))
+        np.testing.assert_array_equal(batched_W.view(np.uint64), single_W.view(np.uint64))
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype_name,np_dtype", [("fp32", np.float32), ("fp64", np.float64)])
+@pytest.mark.parametrize("update_h", [False, True], ids=["fixed-h", "factorize"])
+@pytest.mark.parametrize("shuffle", [False, True], ids=["cyclic", "shuffled"])
+def test_cd_row_tiling_agrees_with_untiled(
+    kernel, monkeypatch, device, dtype_name, np_dtype, update_h, shuffle
+):
+    """Row windows change only rounding; untiled runs keep their exact bits.
+
+    Seed 213 generates synthetic positive input, not a downloaded fixture.
+    Ratio 1 and automatic sizing keep all 2065 rows resident, so they match
+    the untiled bits. Half and third windows split the sums over cells, so
+    factors, reconstruction error and stopping must agree numerically.
+    """
+    torch = require_nmf_runtime()
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+
+    rng = np.random.default_rng(213)
+    X = (rng.random((2065, 17)) + 0.1).astype(np_dtype)
+    nmf_kwargs = _cd_nmf_kwargs(
+        3, seed=0, max_iter=40, tol=0.03, update_H=update_h, shuffle=shuffle
+    )
+    if not update_h:
+        nmf_kwargs["H"] = (rng.random((3, 17)) + 0.1).astype(np_dtype)
+    options = dict(device=device, dtype=dtype_name, allow_tf32=False, compile=False)
+    captured = []
+    original_fit = kernel.solver_cd._fit_cd
+
+    def capture_iterations(*args, **kwargs):
+        result = original_fit(*args, **kwargs)
+        captured.append(result[2].cpu().numpy().copy())
+        return result
+
+    monkeypatch.setattr(kernel.solver_cd, "_fit_cd", capture_iterations)
+    expected = kernel.solver_cd._nmf_gpu_cd(X, [0, 7], nmf_kwargs, options)
+    expected_n_iter = captured[-1]
+    assert (expected_n_iter < nmf_kwargs["max_iter"]).all()
+    # CPU/sklearn and CUDA use different arithmetic: require numerical parity.
+    rtol, atol = (2e-4, 2e-5) if dtype_name == "fp32" else (2e-9, 2e-10)
+    sse_rtol = 1e-5 if dtype_name == "fp32" else 1e-12
+    for replicate, seed in enumerate((0, 7)):
+        reference_H, reference_W, reference_n_iter = _sklearn_cd_reference(
+            X, dict(nmf_kwargs, random_state=seed)
+        )
+        np.testing.assert_allclose(expected[replicate][0], reference_H, rtol=rtol, atol=atol)
+        np.testing.assert_allclose(expected[replicate][1], reference_W, rtol=rtol, atol=atol)
+        assert expected_n_iter[replicate] == reference_n_iter
+
+    def sse(H, W):
+        return float(np.square(X.astype(np.float64) - W @ H).sum())
+
+    for ratio in (0, 1, 0.5, 1 / 3):
+        actual = kernel.solver_cd._nmf_gpu_cd(
+            X, [0, 7], nmf_kwargs, dict(options, row_tiling_ratio=ratio)
+        )
+        n_iter = captured[-1]
+        for replicate, ((actual_H, actual_W), (expected_H, expected_W)) in enumerate(
+            zip(actual, expected)
+        ):
+            assert_valid_nmf_output(X, actual_H, actual_W, 3)
+            if not update_h:
+                np.testing.assert_array_equal(actual_H, nmf_kwargs["H"])
+            if ratio in (0, 1):
+                # Every row stays resident: the untiled path, bit for bit.
+                np.testing.assert_array_equal(n_iter, expected_n_iter)
+                np.testing.assert_array_equal(actual_H.view(np.uint64), expected_H.view(np.uint64))
+                np.testing.assert_array_equal(actual_W.view(np.uint64), expected_W.view(np.uint64))
+                continue
+            assert abs(int(n_iter[replicate]) - int(expected_n_iter[replicate])) <= 1
+            expected_sse = sse(expected_H, expected_W)
+            assert abs(sse(actual_H, actual_W) - expected_sse) <= sse_rtol * expected_sse
+            if n_iter[replicate] == expected_n_iter[replicate]:
+                np.testing.assert_allclose(actual_H, expected_H, rtol=rtol, atol=atol)
+                np.testing.assert_allclose(actual_W, expected_W, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("ratio", [None, 0, 1, 0.5, 1 / 3])
+def test_gpu_kwargs_from_args_forwards_cd_row_tiling_ratio(kernel, ratio):
+    """The optional CLI value must survive argument-to-runtime resolution."""
+    args = _engine_args(engine="gpu", solver="cd", gpu_row_tiling_ratio=ratio)
+    assert kernel.utils.gpu_kwargs_from_args(args)["row_tiling_ratio"] == ratio
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("dtype_name,np_dtype", [("fp32", np.float32), ("fp64", np.float64)])
+def test_cd_fixed_h_products_are_computed_once_on_selected_device(
+    kernel, monkeypatch, device, dtype_name, np_dtype
+):
+    """Fixed-H products are computed once on the device, one window at a time.
+
+    GEMMs follow the row window: the whole matrix when untiled, otherwise
+    floor(n * ratio) rows plus the remainder. Counting Tensor matmuls also
+    catches accidentally restoring NumPy products.
+    """
+    torch = require_nmf_runtime()
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(215)
+    X = (rng.random((2065, 17)) + 0.1).astype(np_dtype)
+    fixed_H = (rng.random((3, 17)) + 0.1).astype(np_dtype)
+    nmf_kwargs = _cd_nmf_kwargs(3, seed=0, max_iter=4, update_H=False, H=fixed_H)
+    calls = []
+    matmul = torch.Tensor.__matmul__
+
+    def record_matmul(left, right):
+        assert left.device.type == right.device.type == device
+        assert not torch.is_grad_enabled()
+        if device == "cuda":
+            assert not torch.backends.cuda.matmul.allow_tf32
+        calls.append((tuple(left.shape), tuple(right.shape)))
+        return matmul(left, right)
+
+    monkeypatch.setattr(torch.Tensor, "__matmul__", record_matmul)
+    for ratio in (None, 0.5, 1 / 3):
+        calls.clear()
+        outputs = kernel.solver_cd._nmf_gpu_cd(
+            X, [0, 7], nmf_kwargs,
+            dict(device=device, dtype=dtype_name, row_tiling_ratio=ratio, allow_tf32=False),
+        )
+        rows = len(X) if ratio is None else max(1, int(len(X) * ratio))
+        windows = [min(rows, len(X) - start) for start in range(0, len(X), rows)]
+        # Two replicate Grams, then each window's cross-products for each
+        # replicate; nothing is recomputed during the four W iterations.
+        assert calls == [((3, 17), (17, 3))] * 2 + [
+            ((3, 17), (17, window)) for window in windows for _ in range(2)
+        ]
+        for actual_H, actual_W in outputs:
+            assert_valid_nmf_output(X, actual_H, actual_W, 3)
+            np.testing.assert_array_equal(actual_H, fixed_H)
 
 
 # ---------------------------------------------------------------------
@@ -1087,6 +1227,7 @@ def test_resolve_gpu_opts_dict_values_override_defaults(kernel):
         "check_every": 7,
         "compile_block": 9,
         "batch": 1,             # not overridden here -> default
+        "row_tiling_ratio": None,  # not overridden here -> default
     }
 
 
@@ -1693,6 +1834,7 @@ def _engine_args(**overrides):
         "gpu_check_every": None,
         "gpu_compile_block": None,
         "gpu_batch": None,
+        "gpu_row_tiling_ratio": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -1713,6 +1855,7 @@ def run_nmf_gpu(kernel, X, nmf_kwargs, gpu_kwargs=None):
         gpu_check_every=gpu_kwargs.get("check_every"),
         gpu_compile_block=gpu_kwargs.get("compile_block"),
         gpu_batch=gpu_kwargs.get("batch"),
+        gpu_row_tiling_ratio=gpu_kwargs.get("row_tiling_ratio"),
     )
     return kernel._nmf_gpu(args, X, nmf_kwargs)
 
@@ -1792,6 +1935,7 @@ def test_gpu_kwargs_from_args_normalizes_cli_overrides(kernel):
         "check_every": 5,
         "compile_block": 100,
         "batch": 1,          # default added; not set on the CLI here
+        "row_tiling_ratio": None,  # default added; not set on the CLI here
     }
 
 
